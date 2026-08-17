@@ -1661,6 +1661,39 @@ u8 sqlite3GetVarint(const unsigned char *p, u64 *v){
 }
 
 /*
+** sqlite3PutVarintRowid() / sqlite3GetVarintRowid() are the disk-io
+** abstraction boundary for table-btree rowids: every place that encodes
+** or decodes a rowid to/from the on-disk cell format should go through
+** these rather than calling sqlite3PutVarint()/sqlite3GetVarint()
+** directly on the raw bits of a rowid_t.
+**
+** In a default build rowid_t is a signed 64-bit integer identical to i64,
+** and these are a thin wrapper around the existing 9-byte-max varint
+** codec (same on-disk bytes as always -- this is not a format change).
+**
+** In a SQLITE_128BIT_ROWID build, the encoding these use depends on
+** whether the specific b-tree being read/written has been marked "wide"
+** (see the BTREE_ROWID_FORMAT meta value and BtShared.rowidWide): narrow
+** b-trees still use this exact 9-byte codec (so legacy files remain
+** byte-for-byte readable), while wide b-trees use a different, longer
+** encoding capable of representing the full 128 bits. That wide codec,
+** and the logic that decides when to switch a database over to it, is
+** added in a later phase; for now sqlite3GetVarintRowid()/
+** sqlite3PutVarintRowid() only implement the narrow codec, so a
+** SQLITE_128BIT_ROWID build behaves like a normal build until the wide
+** path is wired in.
+*/
+int sqlite3PutVarintRowid(unsigned char *p, rowid_t v){
+  return sqlite3PutVarint(p, (u64)rowidToI64(v));
+}
+u8 sqlite3GetVarintRowid(const unsigned char *p, rowid_t *v){
+  u64 v64;
+  u8 n = sqlite3GetVarint(p, &v64);
+  *v = rowidFromI64((i64)v64);
+  return n;
+}
+
+/*
 ** Return the value of a variable-length integer without computing
 ** its length.  This is an optimization on sqlite3GetVarint() for the
 ** cases when the return value of sqlite3GetVarint() is not needed.

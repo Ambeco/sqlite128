@@ -1277,7 +1277,7 @@ static void btreeParseCellPtrNoPayload(
 #ifndef SQLITE_DEBUG
   UNUSED_PARAMETER(pPage);
 #endif
-  pInfo->nSize = 4 + sqlite3GetVarint(&pCell[4], (u64*)&pInfo->nKey);
+  pInfo->nSize = 4 + sqlite3GetVarintRowid(&pCell[4], &pInfo->nKey);
   pInfo->nPayload = 0;
   pInfo->nLocal = 0;
   pInfo->pPayload = 0;
@@ -1354,7 +1354,13 @@ static void btreeParseCellPtr(
   }
   pIter++;
 
-  pInfo->nKey = *(i64*)&iKey;
+  /* This inlined fast path only ever decodes the standard 9-byte-max
+  ** varint (see the block comment above), so it can never produce a
+  ** value wider than 64 bits -- it is exactly the "narrow" codec that
+  ** sqlite3GetVarintRowid() also implements, just unrolled for speed.
+  ** rowidFromI64() sign-extends into rowid_t at no cost in a build
+  ** where rowid_t is still just i64. */
+  pInfo->nKey = rowidFromI64(*(i64*)&iKey);
   pInfo->nPayload = (u32)nPayload;
   pInfo->pPayload = pIter;
   testcase( nPayload==pPage->maxLocal );
@@ -7135,7 +7141,7 @@ static int fillInCell(
     nSrc = pX->nData;
     assert( pPage->intKeyLeaf ); /* fillInCell() only called for leaves */
     nHeader += putVarint32(&pCell[nHeader], nPayload);
-    nHeader += sqlite3PutVarint(&pCell[nHeader], *(u64*)&pX->nKey);
+    nHeader += sqlite3PutVarintRowid(&pCell[nHeader], pX->nKey);
   }else{
     assert( pX->nKey<=0x7fffffff && pX->pKey!=0 );
     nSrc = nPayload = (int)pX->nKey;
@@ -8884,7 +8890,7 @@ static int balance_nonroot(
       j--;
       pNew->xParseCell(pNew, b.apCell[j], &info);
       pCell = pTemp;
-      sz = 4 + sqlite3PutVarint(&pCell[4], info.nKey);
+      sz = 4 + sqlite3PutVarintRowid(&pCell[4], info.nKey);
       pTemp = 0;
     }else{
       pCell -= 4;
@@ -9756,7 +9762,7 @@ end_insert:
 **
 ** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
 */
-int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 iKey){
+int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, rowid_t iKey){
   BtShared *pBt = pDest->pBt;
   u8 *aOut = pBt->pTmpSpace;    /* Pointer to next output buffer */
   const u8 *aIn;                /* Pointer to next input buffer */
@@ -9769,7 +9775,7 @@ int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 iKey){
   }else{
     aOut += sqlite3PutVarint(aOut, pSrc->info.nPayload);
   }
-  if( pDest->pKeyInfo==0 ) aOut += sqlite3PutVarint(aOut, iKey);
+  if( pDest->pKeyInfo==0 ) aOut += sqlite3PutVarintRowid(aOut, iKey);
   nIn = pSrc->info.nLocal;
   aIn = pSrc->info.pPayload;
   if( aIn+nIn>pSrc->pPage->aDataEnd ){

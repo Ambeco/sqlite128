@@ -918,6 +918,32 @@ typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
   static SQLITE_INLINE rowid_t rowidFromLen(u64 x){ return (rowid_t)x; }
 #endif
 
+/*
+** rowidFromI64()/rowidToI64() convert between rowid_t and the plain
+** signed 64-bit integer used by the legacy ("narrow") on-disk rowid
+** encoding and by callers that are known to only ever handle rowids
+** that fit in 64 bits (e.g. AUTOINCREMENT's sqlite_sequence bookkeeping,
+** which is defined in terms of a 64-bit column). Unlike rowidToLen(),
+** these preserve sign: a legacy on-disk rowid is a signed 64-bit value,
+** and sign-extending it into a wider rowid_t (rather than zero-extending)
+** is required to keep negative rowids negative. rowidToI64() asserts (in
+** SQLITE_128BIT_ROWID builds) that the value actually fits in 64 bits;
+** callers on a path that might legitimately see a wider value must not
+** use it -- that is precisely the read-side check Phase 4 adds.
+*/
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE i64 rowidToI64(rowid_t x){
+    assert( x.hi==0 || x.hi==(u64)-1 );  /* fits in a signed 64-bit value */
+    return (i64)x.lo;
+  }
+  static SQLITE_INLINE rowid_t rowidFromI64(i64 x){
+    rowid_t r; r.lo = (u64)x; r.hi = (x<0) ? (u64)-1 : 0; return r;
+  }
+#else
+  static SQLITE_INLINE i64 rowidToI64(rowid_t x){ return (i64)x; }
+  static SQLITE_INLINE rowid_t rowidFromI64(i64 x){ return (rowid_t)x; }
+#endif
+
 typedef UINT32_TYPE u32;           /* 4-byte unsigned integer */
 typedef UINT16_TYPE u16;           /* 2-byte unsigned integer */
 typedef INT16_TYPE i16;            /* 2-byte signed integer */
@@ -5473,6 +5499,8 @@ int sqlite3VListNameToNum(VList*,const char*,int);
 */
 int sqlite3PutVarint(unsigned char*, u64);
 u8 sqlite3GetVarint(const unsigned char *, u64 *);
+int sqlite3PutVarintRowid(unsigned char*, rowid_t);
+u8 sqlite3GetVarintRowid(const unsigned char*, rowid_t*);
 i64 sqlite3VarintValue(const unsigned char*);
 u8 sqlite3GetVarint32(const unsigned char *, u32 *);
 int sqlite3VarintLen(u64 v);

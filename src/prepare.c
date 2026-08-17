@@ -215,7 +215,7 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
 #endif
   Db *pDb;
   char const *azArg[6];
-  int meta[5];
+  int meta[9];   /* [8] (BTREE_ROWID_FORMAT-1) added for SQLITE_128BIT_ROWID */
   InitData initData;
   const char *zSchemaTabName;
   int openedTransaction = 0;
@@ -295,8 +295,7 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
   **    meta[5]   User version
   **    meta[6]   Incremental vacuum mode
   **    meta[7]   unused
-  **    meta[8]   unused
-  **    meta[9]   unused
+  **    meta[8]   Rowid format (0 = narrow/legacy; see BTREE_ROWID_FORMAT)
   **
   ** Note: The #defined SQLITE_UTF* symbols in sqliteInt.h correspond to
   ** the possible values of meta[4].
@@ -363,6 +362,22 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
     rc = SQLITE_ERROR;
     goto initone_error_out;
   }
+
+  /* BTREE_ROWID_FORMAT is 0 in every database written by a build without
+  ** SQLITE_128BIT_ROWID, and in every SQLITE_128BIT_ROWID-build database
+  ** that has never had a rowid >64 bits written to it. It only becomes
+  ** nonzero once a wide rowid is actually written (see Phase 4). A build
+  ** without SQLITE_128BIT_ROWID cannot represent such a rowid at all, so
+  ** it must refuse to open the file rather than silently truncate keys.
+  */
+#ifndef SQLITE_128BIT_ROWID
+  if( meta[BTREE_ROWID_FORMAT-1]!=0 ){
+    sqlite3SetString(pzErrMsg, db, "database uses 128-bit rowids; rebuild "
+                      "sqlite3 with SQLITE_128BIT_ROWID to open it");
+    rc = SQLITE_ERROR;
+    goto initone_error_out;
+  }
+#endif
 
   /* Ticket #2804:  When we open a database in the newer file format,
   ** clear the legacy_file_format pragma flag so that a VACUUM will

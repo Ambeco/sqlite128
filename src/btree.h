@@ -158,6 +158,13 @@ int sqlite3BtreeNewDb(Btree *p);
 #define BTREE_USER_VERSION        6
 #define BTREE_INCR_VACUUM         7
 #define BTREE_APPLICATION_ID      8
+#define BTREE_ROWID_FORMAT        9  /* 0/unset = narrow (<=64-bit) rowids
+                                      ** only; nonzero = at least one wide
+                                      ** (>64-bit) rowid has been written
+                                      ** somewhere in this database and a
+                                      ** build without SQLITE_128BIT_ROWID
+                                      ** must refuse to open it. See
+                                      ** sqlite3BtreeRowidFormatCheck(). */
 #define BTREE_DATA_VERSION        15  /* A virtual meta-value */
 
 /*
@@ -387,7 +394,7 @@ void sqlite3BtreeCursorList(Btree*);
   int sqlite3BtreeCheckpoint(Btree*, int, int *, int *);
 #endif
 
-int sqlite3BtreeTransferRow(BtCursor*, BtCursor*, i64);
+int sqlite3BtreeTransferRow(BtCursor*, BtCursor*, rowid_t);
 
 void sqlite3BtreeClearCache(Btree*);
 

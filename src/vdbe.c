@@ -5996,14 +5996,14 @@ case OP_Insert: {
 case OP_RowCell: {
   VdbeCursor *pDest;              /* Cursor to write to */
   VdbeCursor *pSrc;               /* Cursor to read from */
-  i64 iKey;                       /* Rowid value to insert with */
+  rowid_t iKey;                    /* Rowid value to insert with */
   assert( pOp[1].opcode==OP_Insert || pOp[1].opcode==OP_IdxInsert );
   assert( pOp[1].opcode==OP_Insert    || pOp->p3==0 );
   assert( pOp[1].opcode==OP_IdxInsert || pOp->p3>0 );
   assert( pOp[1].p5 & OPFLAG_PREFORMAT );
   pDest = p->apCsr[pOp->p1];
   pSrc = p->apCsr[pOp->p2];
-  iKey = pOp->p3 ? aMem[pOp->p3].u.i : 0;
+  iKey = pOp->p3 ? rowidFromI64(aMem[pOp->p3].u.i) : rowidFromI64(0);
   rc = sqlite3BtreeTransferRow(pDest->uc.pCursor, pSrc->uc.pCursor, iKey);
   if( rc!=SQLITE_OK ) goto abort_due_to_error;
   break;
