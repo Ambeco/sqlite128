@@ -870,7 +870,7 @@ void sqlite3BtreeClearCursor(BtCursor *pCur){
 static int btreeMoveto(
   BtCursor *pCur,     /* Cursor open on the btree to be searched */
   const void *pKey,   /* Packed key if the btree is an index */
-  i64 nKey,           /* Integer key for tables.  Size of pKey for indices */
+  rowid_t nKey,       /* Integer key for tables.  Size of pKey for indices */
   int bias,           /* Bias search to the high end */
   int *pRes           /* Write search results here */
 ){
@@ -4948,7 +4948,7 @@ int sqlite3BtreeCursorIsValidNN(BtCursor *pCur){
 ** ordinary table btree.  If the cursor points to an index btree or
 ** is invalid, the result of this routine is undefined.
 */
-i64 sqlite3BtreeIntegerKey(BtCursor *pCur){
+rowid_t sqlite3BtreeIntegerKey(BtCursor *pCur){
   assert( cursorHoldsMutex(pCur) );
   assert( pCur->eState==CURSOR_VALID );
   assert( pCur->curIntKey );
@@ -5836,7 +5836,7 @@ int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
 */
 int sqlite3BtreeTableMoveto(
   BtCursor *pCur,          /* The cursor to be moved */
-  i64 intKey,              /* The table key */
+  rowid_t intKey,          /* The table key */
   int biasRight,           /* If true, bias the search to the high end */
   int *pRes                /* Write search results here */
 ){

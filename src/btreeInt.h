@@ -478,7 +478,7 @@ struct BtShared {
 ** based on information extract from the raw disk page.
 */
 struct CellInfo {
-  i64 nKey;      /* The key for INTKEY tables, or nPayload otherwise */
+  rowid_t nKey;  /* The key for INTKEY tables, or nPayload otherwise */
   u8 *pPayload;  /* Pointer to the start of payload */
   u32 nPayload;  /* Bytes of payload */
   u16 nLocal;    /* Amount of payload held locally, not on overflow */
@@ -548,7 +548,7 @@ struct BtCursor {
   BtShared *pBt;            /* The BtShared this cursor points to */
   BtCursor *pNext;          /* Forms a linked list of all cursors */
   CellInfo info;            /* A parse of the cell we are pointing at */
-  i64 nKey;                 /* Size of pKey, or last integer key */
+  rowid_t nKey;              /* Size of pKey, or last integer key */
   Pgno pgnoRoot;            /* The root page of this tree */
   i8 iPage;                 /* Index of current page in apPage */
   u8 curIntKey;             /* Value of apPage[0]->intKey */

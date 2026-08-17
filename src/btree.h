@@ -262,7 +262,7 @@ void sqlite3BtreeCursorHint(BtCursor*, int, ...);
 int sqlite3BtreeCloseCursor(BtCursor*);
 int sqlite3BtreeTableMoveto(
   BtCursor*,
-  i64 intKey,
+  rowid_t intKey,
   int bias,
   int *pRes
 );
@@ -316,7 +316,7 @@ int sqlite3BtreeDelete(BtCursor*, u8 flags);
 */
 struct BtreePayload {
   const void *pKey;       /* Key content for indexes.  NULL for tables */
-  sqlite3_int64 nKey;     /* Size of pKey for indexes.  PRIMARY KEY for tabs */
+  rowid_t nKey;           /* Size of pKey for indexes.  PRIMARY KEY for tabs */
   const void *pData;      /* Data for tables. */
   sqlite3_value *aMem;    /* First of nMem value in the unpacked pKey */
   u16 nMem;               /* Number of aMem[] value.  Might be zero */
@@ -332,7 +332,7 @@ int sqlite3BtreeLast(BtCursor*, int *pRes);
 int sqlite3BtreeNext(BtCursor*, int flags);
 int sqlite3BtreeEof(BtCursor*);
 int sqlite3BtreePrevious(BtCursor*, int flags);
-i64 sqlite3BtreeIntegerKey(BtCursor*);
+rowid_t sqlite3BtreeIntegerKey(BtCursor*);
 void sqlite3BtreeCursorPin(BtCursor*);
 void sqlite3BtreeCursorUnpin(BtCursor*);
 i64 sqlite3BtreeOffset(BtCursor*);

@@ -870,6 +870,54 @@
 #endif
 typedef sqlite_int64 i64;          /* 8-byte signed integer */
 typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
+
+/*
+** rowid_t is the type used to hold the integer key ("rowid") of a
+** row in a table btree, everywhere that value flows through the
+** system: cursor caches, the VDBE, the public last-insert-rowid API,
+** and the on-disk varint encoding of table-btree cell keys.
+**
+** By default this is a plain 64-bit signed integer, identical to i64,
+** so builds without SQLITE_128BIT_ROWID behave exactly as before.
+** When SQLITE_128BIT_ROWID is defined, rowid_t widens to a 128-bit
+** integer type (see sqliteInt128.h) and every rowid_t use site below
+** must go through the rowid_t abstraction functions rather than
+** assuming a native scalar. Do NOT use rowid_t interchangeably with
+** i64/u64 in new code -- use it only for values that are genuinely
+** table-btree rowids.
+*/
+#ifdef SQLITE_128BIT_ROWID
+# include "sqliteInt128.h"
+  typedef sqlite3_uint128 rowid_t;
+#else
+  typedef i64 rowid_t;
+#endif
+
+/*
+** A handful of fields (BtreePayload.nKey, CellInfo.nKey, BtCursor's cached
+** key) are shared between two different uses: for table btrees the value
+** is a rowid; for index btrees the very same field holds the byte length
+** of the index key, which is never wider than 64 bits (SQLITE_MAX_LENGTH
+** is a 32-bit quantity). Rather than union the field -- which risks a
+** write-as-one/read-as-other bug -- the field is typed rowid_t everywhere
+** and these two helpers convert to/from the plain 64-bit length at the
+** boundary. rowidToLen() asserts (in SQLITE_128BIT_ROWID builds) that no
+** high-order bits are set, since a byte length can never legitimately use
+** them; rowidFromLen() zero-extends a length into a rowid_t.
+*/
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE u64 rowidToLen(rowid_t x){
+    assert( x.hi==0 );
+    return x.lo;
+  }
+  static SQLITE_INLINE rowid_t rowidFromLen(u64 x){
+    rowid_t r; r.lo = x; r.hi = 0; return r;
+  }
+#else
+  static SQLITE_INLINE u64 rowidToLen(rowid_t x){ return (u64)x; }
+  static SQLITE_INLINE rowid_t rowidFromLen(u64 x){ return (rowid_t)x; }
+#endif
+
 typedef UINT32_TYPE u32;           /* 4-byte unsigned integer */
 typedef UINT16_TYPE u16;           /* 2-byte unsigned integer */
 typedef INT16_TYPE i16;            /* 2-byte signed integer */
@@ -1692,7 +1740,7 @@ struct sqlite3 {
   int nDb;                      /* Number of backends currently in use */
   u32 mDbFlags;                 /* flags recording internal state */
   u64 flags;                    /* flags settable by pragmas. See below */
-  i64 lastRowid;                /* ROWID of most recent insert (see above) */
+  rowid_t lastRowid;             /* ROWID of most recent insert (see above) */
   i64 szMmap;                   /* Default mmap_size setting */
   u32 nSchemaLock;              /* Do not reset the schema when non-zero */
   unsigned int openFlags;       /* Flags passed to sqlite3_vfs.xOpen() */
