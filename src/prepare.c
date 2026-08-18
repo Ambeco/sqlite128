@@ -374,14 +374,18 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
   ** test/quick.test) and masked the real "malformed" error.
   **
   ** The actual, trustworthy protection against a narrow build opening a
-  ** wide-rowid file is the file_format bump: when a rowid >64 bits is
-  ** actually written, Phase 4 raises the on-disk file_format to a new
-  ** value that SQLITE_MAX_FILE_FORMAT here doesn't accept, so the
-  ** ordinary check above -- unconditional, and already relied upon by
-  ** every existing SQLite build, this fork's or not -- rejects the file
-  ** on its own. BTREE_ROWID_FORMAT remains available for a friendlier,
-  ** more specific error message once it's cross-checked against that
-  ** file_format signal, but must never be trusted in isolation.
+  ** wide-rowid file is the page-1 magic header string (btree.c's
+  ** zMagicHeader vs zMagicHeaderWide / BTS_WIDE_ROWID): when a rowid
+  ** >64 bits is actually written, the header gets rewritten to a value
+  ** no build without SQLITE_128BIT_ROWID -- including any unmodified
+  ** mainline SQLite, any version -- will ever recognize, so btree.c's
+  ** own page-1 sanity check rejects the file before execution even
+  ** reaches here. The file_format bump is a secondary signal for the
+  ** same event (belt-and-suspenders; a numeric ceiling mainline itself
+  ** could in principle someday raise, unlike the magic string). Either
+  ** way, BTREE_ROWID_FORMAT remains available for a friendlier, more
+  ** specific error message once cross-checked against one of those
+  ** stronger signals, but must never be trusted in isolation.
   */
 
   /* Ticket #2804:  When we open a database in the newer file format,
