@@ -465,19 +465,17 @@ u8 sqlite3StrIHash(const char *z){
   return h;
 }
 
-#if !defined(SQLITE_DISABLE_INTRINSIC)               \
-  && (defined(__GNUC__) || defined(__clang__))       \
-  && (defined(__x86_64__) || defined(__aarch64__) || \
-      (defined(__riscv) && defined(__riscv_xlen) && (__riscv_xlen>32)))
-#define SQLITE_USE_UINT128
-#endif
+/* SQLITE_USE_UINT128 is detected in sqliteInt.h (it needs to be visible
+** before sqliteInt128.h is included there, to pick sqlite3_uint128's
+** representation) and is available here as a side effect of the
+** #include "sqliteInt.h" above. */
 
 /*
 ** Two inputs are multiplied to get a 128-bit result.  Write the
 ** lower 64-bits of the result into *pLo, and return the high-order
 ** 64 bits.
 */
-static u64 sqlite3Multiply128(u64 a, u64 b, u64 *pLo){
+u64 sqlite3Multiply128(u64 a, u64 b, u64 *pLo){
 #if defined(SQLITE_USE_UINT128)
   __uint128_t r = (__uint128_t)a * b;
   *pLo = (u64)r;

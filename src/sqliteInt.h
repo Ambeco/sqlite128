@@ -872,6 +872,22 @@ typedef sqlite_int64 i64;          /* 8-byte signed integer */
 typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
 
 /*
+** SQLITE_USE_UINT128 marks compilers/targets where a native 128-bit
+** integer type (__uint128_t) is available. It backs both the existing
+** sqlite3Multiply128() fast path (util.c) and, when SQLITE_128BIT_ROWID
+** is defined, sqlite3_uint128 (sqliteInt128.h). It must be detected
+** here rather than in util.c so that sqliteInt128.h -- included below,
+** before util.c is ever compiled -- sees a decision that's consistent
+** for every translation unit.
+*/
+#if !defined(SQLITE_USE_UINT128) && !defined(SQLITE_DISABLE_INTRINSIC) \
+  && (defined(__GNUC__) || defined(__clang__))                        \
+  && (defined(__x86_64__) || defined(__aarch64__) ||                  \
+      (defined(__riscv) && defined(__riscv_xlen) && (__riscv_xlen>32)))
+# define SQLITE_USE_UINT128
+#endif
+
+/*
 ** rowid_t is the type used to hold the integer key ("rowid") of a
 ** row in a table btree, everywhere that value flows through the
 ** system: cursor caches, the VDBE, the public last-insert-rowid API,
