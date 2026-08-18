@@ -363,21 +363,26 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
     goto initone_error_out;
   }
 
-  /* BTREE_ROWID_FORMAT is 0 in every database written by a build without
-  ** SQLITE_128BIT_ROWID, and in every SQLITE_128BIT_ROWID-build database
-  ** that has never had a rowid >64 bits written to it. It only becomes
-  ** nonzero once a wide rowid is actually written (see Phase 4). A build
-  ** without SQLITE_128BIT_ROWID cannot represent such a rowid at all, so
-  ** it must refuse to open the file rather than silently truncate keys.
+  /* NB: BTREE_ROWID_FORMAT (meta slot 9) is intentionally *not* checked
+  ** here on its own. That slot was unused/reserved before this fork, so
+  ** sqlite's own byte-corruption fuzz tests (which flip random bytes
+  ** anywhere in the file, including reserved meta slots, and expect a
+  ** generic corruption error) can and do produce nonzero garbage there
+  ** on an otherwise ordinary narrow-rowid database -- treating any
+  ** nonzero value as "this is a legitimate wide-rowid database" caused
+  ** exactly that false positive (see fts5corrupt3-25.1/corruptL-18.1 in
+  ** test/quick.test) and masked the real "malformed" error.
+  **
+  ** The actual, trustworthy protection against a narrow build opening a
+  ** wide-rowid file is the file_format bump: when a rowid >64 bits is
+  ** actually written, Phase 4 raises the on-disk file_format to a new
+  ** value that SQLITE_MAX_FILE_FORMAT here doesn't accept, so the
+  ** ordinary check above -- unconditional, and already relied upon by
+  ** every existing SQLite build, this fork's or not -- rejects the file
+  ** on its own. BTREE_ROWID_FORMAT remains available for a friendlier,
+  ** more specific error message once it's cross-checked against that
+  ** file_format signal, but must never be trusted in isolation.
   */
-#ifndef SQLITE_128BIT_ROWID
-  if( meta[BTREE_ROWID_FORMAT-1]!=0 ){
-    sqlite3SetString(pzErrMsg, db, "database uses 128-bit rowids; rebuild "
-                      "sqlite3 with SQLITE_128BIT_ROWID to open it");
-    rc = SQLITE_ERROR;
-    goto initone_error_out;
-  }
-#endif
 
   /* Ticket #2804:  When we open a database in the newer file format,
   ** clear the legacy_file_format pragma flag so that a VACUUM will
