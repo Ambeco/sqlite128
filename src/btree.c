@@ -601,7 +601,7 @@ static void invalidateAllOverflowCache(BtShared *pBt){
 static void invalidateIncrblobCursors(
   Btree *pBtree,          /* The database file to check */
   Pgno pgnoRoot,          /* The table that might be changing */
-  i64 iRow,               /* The rowid that might be changing */
+  rowid_t iRow,            /* The rowid that might be changing */
   int isClearTable        /* True if all rows are being deleted */
 ){
   BtCursor *p;
@@ -611,7 +611,7 @@ static void invalidateIncrblobCursors(
   for(p=pBtree->pBt->pCursor; p; p=p->pNext){
     if( (p->curFlags & BTCF_Incrblob)!=0 ){
       pBtree->hasIncrblobCur = 1;
-      if( p->pgnoRoot==pgnoRoot && (isClearTable || p->info.nKey==iRow) ){
+      if( p->pgnoRoot==pgnoRoot && (isClearTable || rowidEqual(p->info.nKey,iRow)) ){
         p->eState = CURSOR_INVALID;
       }
     }
@@ -738,12 +738,12 @@ static int saveCursorKey(BtCursor *pCur){
     ** position is restored. Hence the 17 bytes of padding allocated
     ** below. */
     void *pKey;
-    pCur->nKey = sqlite3BtreePayloadSize(pCur);
-    pKey = sqlite3Malloc( ((i64)pCur->nKey) + 9 + 8 );
+    pCur->nKey = rowidFromLen(sqlite3BtreePayloadSize(pCur));
+    pKey = sqlite3Malloc( ((i64)rowidToLen(pCur->nKey)) + 9 + 8 );
     if( pKey ){
-      rc = sqlite3BtreePayload(pCur, 0, (int)pCur->nKey, pKey);
+      rc = sqlite3BtreePayload(pCur, 0, (u32)rowidToLen(pCur->nKey), pKey);
       if( rc==SQLITE_OK ){
-        memset(((u8*)pKey)+pCur->nKey, 0, 9+8);
+        memset(((u8*)pKey)+rowidToLen(pCur->nKey), 0, 9+8);
         pCur->pKey = pKey;
       }else{
         sqlite3_free(pKey);
@@ -879,10 +879,9 @@ static int btreeMoveto(
 
   if( pKey ){
     KeyInfo *pKeyInfo = pCur->pKeyInfo;
-    assert( nKey==(i64)(int)nKey );
     pIdxKey = sqlite3VdbeAllocUnpackedRecord(pKeyInfo);
     if( pIdxKey==0 ) return SQLITE_NOMEM_BKPT;
-    sqlite3VdbeRecordUnpack((int)nKey, pKey, pIdxKey);
+    sqlite3VdbeRecordUnpack(rowidToInt(nKey), pKey, pIdxKey);
     if( pIdxKey->nField==0 || pIdxKey->nField>pKeyInfo->nAllField ){
       rc = SQLITE_CORRUPT_BKPT;
     }else{
@@ -1398,7 +1397,7 @@ static void btreeParseCellPtrIndex(
     }while( *(pIter)>=0x80 && pIter<pEnd );
   }
   pIter++;
-  pInfo->nKey = nPayload;
+  pInfo->nKey = rowidFromLen(nPayload);
   pInfo->nPayload = nPayload;
   pInfo->pPayload = pIter;
   testcase( nPayload==pPage->maxLocal );
@@ -5857,11 +5856,11 @@ int sqlite3BtreeTableMoveto(
   /* If the cursor is already positioned at the point we are trying
   ** to move to, then just return without doing any work */
   if( pCur->eState==CURSOR_VALID && (pCur->curFlags & BTCF_ValidNKey)!=0 ){
-    if( pCur->info.nKey==intKey ){
+    if( rowidEqual(pCur->info.nKey,intKey) ){
       *pRes = 0;
       return SQLITE_OK;
     }
-    if( pCur->info.nKey<intKey ){
+    if( rowidLt(pCur->info.nKey,intKey) ){
       if( (pCur->curFlags & BTCF_AtLast)!=0 ){
         assert( cursorIsAtLastEntry(pCur) || CORRUPT_DB );
         *pRes = -1;
@@ -5871,12 +5870,12 @@ int sqlite3BtreeTableMoveto(
       ** try to get there using sqlite3BtreeNext() rather than a full
       ** binary search.  This is an optimization only.  The correct answer
       ** is still obtained without this case, only a little more slowly. */
-      if( pCur->info.nKey+1==intKey ){
+      if( rowidEqual(rowidAdd1(pCur->info.nKey),intKey) ){
         *pRes = 0;
         rc = sqlite3BtreeNext(pCur, 0);
         if( rc==SQLITE_OK ){
           getCellInfo(pCur);
-          if( pCur->info.nKey==intKey ){
+          if( rowidEqual(pCur->info.nKey,intKey) ){
             return SQLITE_OK;
           }
         }else if( rc!=SQLITE_DONE ){
@@ -5934,22 +5933,27 @@ int sqlite3BtreeTableMoveto(
           }
         }
       }
+      /* This binary search only ever runs against narrow (<=64-bit) table
+      ** btrees -- sqlite3VarintValue() is the legacy 9-byte-max codec, the
+      ** same one sqlite3GetVarintRowid() implements (see btree.c's cell
+      ** parsers). A wide-rowid database uses a different on-disk codec and
+      ** cannot reach this loop; see Phase 4's wide-codec work. */
       nCellKey = sqlite3VarintValue(pCell);
-      if( nCellKey<intKey ){
+      if( rowidLt(rowidFromI64(nCellKey),intKey) ){
         lwr = idx+1;
         if( lwr>upr ){ c = -1; break; }
-      }else if( nCellKey>intKey ){
+      }else if( rowidGt(rowidFromI64(nCellKey),intKey) ){
         upr = idx-1;
         if( lwr>upr ){ c = +1; break; }
       }else{
-        assert( nCellKey==intKey );
+        assert( rowidEqual(rowidFromI64(nCellKey),intKey) );
         pCur->ix = (u16)idx;
         if( !pPage->leaf ){
           lwr = idx;
           goto moveto_table_next_layer;
         }else{
           pCur->curFlags |= BTCF_ValidNKey;
-          pCur->info.nKey = nCellKey;
+          pCur->info.nKey = rowidFromI64(nCellKey);
           pCur->info.nSize = 0;
           *pRes = 0;
           return SQLITE_OK;
@@ -6209,7 +6213,11 @@ bypass_moveto_root:
         u8 * const pCellBody = pCell - pPage->childPtrSize;
         const int nOverrun = 18;  /* Size of the overrun padding */
         pPage->xParseCell(pPage, pCellBody, &pCur->info);
-        nCell = (int)pCur->info.nKey;
+        /* Deliberately truncating, not rowidToInt(): pCur->info.nKey is an
+        ** index-key byte length here, and this cast is depended on to wrap
+        ** to something <2 (caught below) when a corrupt cell claims a size
+        ** of 2^32 or more -- it must not assert on out-of-range input. */
+        nCell = (int)rowidToLen(pCur->info.nKey);
         testcase( nCell<0 );   /* True if key size is 2^32 or more */
         testcase( nCell==0 );  /* Invalid key size:  0x80 0x80 0x00 */
         testcase( nCell==1 );  /* Invalid key size:  0x80 0x80 0x01 */
@@ -7143,8 +7151,8 @@ static int fillInCell(
     nHeader += putVarint32(&pCell[nHeader], nPayload);
     nHeader += sqlite3PutVarintRowid(&pCell[nHeader], pX->nKey);
   }else{
-    assert( pX->nKey<=0x7fffffff && pX->pKey!=0 );
-    nSrc = nPayload = (int)pX->nKey;
+    assert( rowidLe(pX->nKey,rowidFromI64(0x7fffffff)) && pX->pKey!=0 );
+    nSrc = nPayload = rowidToInt(pX->nKey);
     pSrc = pX->pKey;
     nHeader += putVarint32(&pCell[nHeader], nPayload);
   }
@@ -9523,7 +9531,7 @@ int sqlite3BtreeInsert(
 #ifdef SQLITE_DEBUG
     if( flags & BTREE_SAVEPOSITION ){
       assert( pCur->curFlags & BTCF_ValidNKey );
-      assert( pX->nKey==pCur->info.nKey );
+      assert( rowidEqual(pX->nKey,pCur->info.nKey) );
       assert( loc==0 );
     }
 #endif
@@ -9532,7 +9540,7 @@ int sqlite3BtreeInsert(
     ** that the cursor is not pointing to a row to be overwritten.
     ** So do a complete check.
     */
-    if( (pCur->curFlags&BTCF_ValidNKey)!=0 && pX->nKey==pCur->info.nKey ){
+    if( (pCur->curFlags&BTCF_ValidNKey)!=0 && rowidEqual(pX->nKey,pCur->info.nKey) ){
       /* The cursor is pointing to the entry that is to be
       ** overwritten */
       assert( pX->nData>=0 && pX->nZero>=0 );
@@ -9587,10 +9595,10 @@ int sqlite3BtreeInsert(
     */
     if( loc==0 ){
       getCellInfo(pCur);
-      if( pCur->info.nKey==pX->nKey ){
+      if( rowidEqual(pCur->info.nKey,pX->nKey) ){
         BtreePayload x2;
         x2.pData = pX->pKey;
-        x2.nData = (int)pX->nKey;  assert( pX->nKey<=0x7fffffff );
+        x2.nData = rowidToInt(pX->nKey);
         x2.nZero = 0;
         return btreeOverwriteCell(pCur, &x2);
       }
@@ -9730,11 +9738,11 @@ int sqlite3BtreeInsert(
       btreeReleaseAllCursorPages(pCur);
       if( pCur->pKeyInfo ){
         assert( pCur->pKey==0 );
-        pCur->pKey = sqlite3Malloc( pX->nKey );
+        pCur->pKey = sqlite3Malloc( rowidToLen(pX->nKey) );
         if( pCur->pKey==0 ){
           rc = SQLITE_NOMEM;
         }else{
-          memcpy(pCur->pKey, pX->pKey, pX->nKey);
+          memcpy(pCur->pKey, pX->pKey, rowidToLen(pX->nKey));
         }
       }
       pCur->eState = CURSOR_REQUIRESEEK;
@@ -10326,7 +10334,7 @@ int sqlite3BtreeClearTable(Btree *p, int iTable, i64 *pnChange){
     ** is the root of a table b-tree - if it is not, the following call is
     ** a no-op).  */
     if( p->hasIncrblobCur ){
-      invalidateIncrblobCursors(p, (Pgno)iTable, 0, 1);
+      invalidateIncrblobCursors(p, (Pgno)iTable, rowidFromI64(0), 1);
     }
     rc = clearDatabasePage(pBt, (Pgno)iTable, 0, pnChange);
   }
@@ -11023,12 +11031,19 @@ static int checkTreePage(
       continue;
     }
 
-    /* Check for integer primary key out of range */
+    /* Check for integer primary key out of range
+    **
+    ** maxKey/piMinKey stay plain i64 here (integrity-check bookkeeping,
+    ** not itself part of the on-disk format); rowidToI64() is safe as
+    ** long as every cell parser only ever produces narrow keys, which
+    ** holds until the wide on-disk codec exists. Revisit alongside that
+    ** work. */
     if( pPage->intKey ){
-      if( keyCanBeEqual ? (info.nKey > maxKey) : (info.nKey >= maxKey) ){
-        checkAppendMsg(pCheck, "Rowid %lld out of order", info.nKey);
+      i64 iKey = rowidToI64(info.nKey);
+      if( keyCanBeEqual ? (iKey > maxKey) : (iKey >= maxKey) ){
+        checkAppendMsg(pCheck, "Rowid %lld out of order", iKey);
       }
-      maxKey = info.nKey;
+      maxKey = iKey;
       keyCanBeEqual = 0;     /* Only the first key on the page may ==maxKey */
     }
 

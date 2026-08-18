@@ -5048,8 +5048,8 @@ case OP_SeekGT: {       /* jump0, in3, group, ncycle */
         if( (oc & 0x0001)==(OP_SeekLT & 0x0001) ) oc++;
       }
     }
-    rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, (u64)iKey, 0, &res);
-    pC->movetoTarget = iKey;  /* Used by OP_Delete */
+    rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, rowidFromI64(iKey), 0, &res);
+    pC->movetoTarget = rowidFromI64(iKey);  /* Used by OP_Delete */
     if( rc!=SQLITE_OK ){
       goto abort_due_to_error;
     }
@@ -5682,9 +5682,9 @@ notExistsWithKey:
   pCrsr = pC->uc.pCursor;
   assert( pCrsr!=0 );
   res = 0;
-  rc = sqlite3BtreeTableMoveto(pCrsr, iKey, 0, &res);
+  rc = sqlite3BtreeTableMoveto(pCrsr, rowidFromI64(iKey), 0, &res);
   assert( rc==SQLITE_OK || res==0 );
-  pC->movetoTarget = iKey;  /* Used by OP_Delete */
+  pC->movetoTarget = rowidFromI64(iKey);  /* Used by OP_Delete */
   pC->nullRow = 0;
   pC->cacheStatus = CACHE_STALE;
   pC->deferredMoveto = 0;
@@ -5789,7 +5789,11 @@ case OP_NewRowid: {           /* out2 */
         v = 1;   /* IMP: R-61914-48074 */
       }else{
         assert( sqlite3BtreeCursorIsValid(pC->uc.pCursor) );
-        v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+        /* rowidToI64(): this legacy "last rowid + 1" allocator is bounded
+        ** by MAX_ROWID (2^63-1) below, so it's inherently narrow; a table
+        ** that already has a wide rowid in it (once that's possible) needs
+        ** a different allocation strategy, not this one. */
+        v = rowidToI64(sqlite3BtreeIntegerKey(pC->uc.pCursor));
         if( v>=MAX_ROWID ){
           pC->useRandomRowid = 1;
         }else{
@@ -5839,7 +5843,7 @@ case OP_NewRowid: {           /* out2 */
       do{
         sqlite3_randomness(sizeof(v), &v);
         v &= (MAX_ROWID>>1); v++;  /* Ensure that v is greater than zero */
-      }while(  ((rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, (u64)v,
+      }while(  ((rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, rowidFromI64(v),
                                                  0, &res))==SQLITE_OK)
             && (res==0)
             && (++cnt<100));
@@ -5920,7 +5924,7 @@ case OP_Insert: {
   assert( pKey->flags & MEM_Int );
   assert( memIsValid(pKey) );
   REGISTER_TRACE(pOp->p3, pKey);
-  x.nKey = pKey->u.i;
+  x.nKey = rowidFromI64(pKey->u.i);
 
   if( pOp->p4type==P4_TABLE && HAS_UPDATE_HOOK(db) ){
     assert( pC->iDb>=0 );
@@ -5977,7 +5981,7 @@ case OP_Insert: {
     assert( pTab->aCol!=0 );
     db->xUpdateCallback(db->pUpdateArg,
            (pOp->p5 & OPFLAG_ISUPDATE) ? SQLITE_UPDATE : SQLITE_INSERT,
-           zDb, pTab->zName, x.nKey);
+           zDb, pTab->zName, rowidTruncateToI64(x.nKey));
   }
   break;
 }
@@ -6073,8 +6077,8 @@ case OP_Delete: {
     /* If p5 is zero, the seek operation that positioned the cursor prior to
     ** OP_Delete will have also set the pC->movetoTarget field to the rowid of
     ** the row that is being deleted */
-    i64 iKey = sqlite3BtreeIntegerKey(pC->uc.pCursor);
-    assert( CORRUPT_DB || pC->movetoTarget==iKey );
+    rowid_t iKey = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+    assert( CORRUPT_DB || rowidEqual(pC->movetoTarget,iKey) );
   }
 #endif
 
@@ -6106,7 +6110,7 @@ case OP_Delete: {
     );
     sqlite3VdbePreUpdateHook(p, pC,
         (opflags & OPFLAG_ISUPDATE) ? SQLITE_UPDATE : SQLITE_DELETE,
-        zDb, pTab, pC->movetoTarget,
+        zDb, pTab, rowidTruncateToI64(pC->movetoTarget),
         pOp->p3, -1
     );
   }
@@ -6143,7 +6147,7 @@ case OP_Delete: {
     p->nChange++;
     if( db->xUpdateCallback && ALWAYS(pTab!=0) && HasRowid(pTab) ){
       db->xUpdateCallback(db->pUpdateArg, SQLITE_DELETE, zDb, pTab->zName,
-          pC->movetoTarget);
+          rowidTruncateToI64(pC->movetoTarget));
       assert( pC->iDb>=0 );
     }
   }
@@ -6315,7 +6319,11 @@ case OP_Rowid: {                 /* out2, ncycle */
     pOut->flags = MEM_Null;
     break;
   }else if( pC->deferredMoveto ){
-    v = pC->movetoTarget;
+    /* OP_Rowid's output register is a plain SQL integer (Mem.u.i), which
+    ** this fork is intentionally not widening past 64 bits -- see the
+    ** project notes on scope. rowidTruncateToI64() is the deliberate,
+    ** non-asserting narrowing for that boundary. */
+    v = rowidTruncateToI64(pC->movetoTarget);
 #ifndef SQLITE_OMIT_VIRTUALTABLE
   }else if( pC->eCurType==CURTYPE_VTAB ){
     assert( pC->uc.pVCur!=0 );
@@ -6335,7 +6343,7 @@ case OP_Rowid: {                 /* out2, ncycle */
       pOut->flags = MEM_Null;
       break;
     }
-    v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+    v = rowidTruncateToI64(sqlite3BtreeIntegerKey(pC->uc.pCursor));
   }
   pOut->u.i = v;
   break;
@@ -6732,7 +6740,7 @@ case OP_IdxInsert: {        /* in2 */
   assert( pC->isTable==0 );
   rc = ExpandBlob(pIn2);
   if( rc ) goto abort_due_to_error;
-  x.nKey = pIn2->n;
+  x.nKey = rowidFromLen((u64)pIn2->n);
   x.pKey = pIn2->z;
   x.aMem = aMem + pOp->p3;
   x.nMem = (u16)pOp->p4.i;
@@ -6870,7 +6878,7 @@ case OP_DeferredSeek:         /* ncycle */
 case OP_IdxRowid: {           /* out2, ncycle */
   VdbeCursor *pC;             /* The P1 index cursor */
   VdbeCursor *pTabCur;        /* The P2 table cursor (OP_DeferredSeek only) */
-  i64 rowid;                  /* Rowid that P1 current points to */
+  rowid_t rowid;               /* Rowid that P1 current points to */
 
   assert( pOp->p1>=0 && pOp->p1<p->nCursor );
   pC = p->apCsr[pOp->p1];
@@ -6891,7 +6899,7 @@ case OP_IdxRowid: {           /* out2, ncycle */
   if( rc!=SQLITE_OK ) goto abort_due_to_error;
 
   if( !pC->nullRow ){
-    rowid = 0;  /* Not needed.  Only used to silence a warning. */
+    rowid = rowidFromI64(0);  /* Not needed.  Only used to silence a warning. */
     rc = sqlite3VdbeIdxRowid(db, pC->uc.pCursor, &rowid);
     if( rc!=SQLITE_OK ){
       goto abort_due_to_error;
@@ -6919,7 +6927,7 @@ case OP_IdxRowid: {           /* out2, ncycle */
       pTabCur->pAltCursor = pC;
     }else{
       pOut = out2Prerelease(p, pOp);
-      pOut->u.i = rowid;
+      pOut->u.i = rowidTruncateToI64(rowid);  /* Mem.u.i is a plain i64 */
     }
   }else{
     assert( pOp->opcode==OP_IdxRowid );
@@ -8920,7 +8928,7 @@ case OP_VUpdate: {
     sqlite3VtabImportErrmsg(p, pVtab);
     if( rc==SQLITE_OK && pOp->p1 ){
       assert( nArg>1 && apArg[0] && (apArg[0]->flags&MEM_Null) );
-      db->lastRowid = rowid;
+      db->lastRowid = rowidFromI64(rowid);  /* xUpdate's ABI is sqlite_int64 */
     }
     if( (rc&0xff)==SQLITE_CONSTRAINT && pOp->p4.pVtab->bConstraint ){
       if( pOp->p5==OE_Ignore ){

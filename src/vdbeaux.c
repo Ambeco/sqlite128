@@ -5189,7 +5189,7 @@ int sqlite3VdbeIdxRowid(sqlite3 *db, BtCursor *pCur, rowid_t *rowid){
 
   /* Fetch the integer off the end of the index record */
   sqlite3VdbeSerialGet((u8*)&m.z[m.n-lenRowid], typeRowid, &v);
-  *rowid = v.u.i;
+  *rowid = rowidFromI64(v.u.i);
   sqlite3VdbeMemReleaseMalloc(&m);
   return SQLITE_OK;
 

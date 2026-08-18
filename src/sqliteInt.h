@@ -960,6 +960,65 @@ typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
   static SQLITE_INLINE rowid_t rowidFromI64(i64 x){ return (rowid_t)x; }
 #endif
 
+/*
+** rowidTruncateToI64() is rowidToI64() without the "must fit" assert: it
+** silently keeps only the low 64 bits. This is for the handful of spots
+** where a wide rowid_t meeting a fixed-64-bit-wide public interface is
+** an expected, non-buggy situation rather than an internal invariant
+** violation -- namely sqlite3_last_insert_rowid(), whose signature is
+** sqlite_int64 and can't change without breaking ABI. (sqlite3's public
+** API surface is intentionally not being widened to 128 bits; see the
+** project notes on scope.) rowidToI64()'s assert is exactly what should
+** fire everywhere else, so reach for this only at that kind of boundary.
+*/
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE i64 rowidTruncateToI64(rowid_t x){ return (i64)x.lo; }
+#else
+  static SQLITE_INLINE i64 rowidTruncateToI64(rowid_t x){ return (i64)x; }
+#endif
+
+/*
+** General-purpose signed comparison and arithmetic on rowid_t, needed
+** anywhere code used to write nKey==x, nKey<x, nKey+1, (int)nKey, etc.
+** back when rowid_t was just a scalar i64. rowidCompare() returns
+** <0/0/>0 like memcmp(); the rest are built on it (or, in a default
+** build, degrade to the obvious native operator/cast -- these exist so
+** the *source* is portable between representations, not to add
+** overhead to the common case).
+**
+** rowidToInt() is for the handful of places that need a plain `int`
+** out of a rowid_t that is known, by construction, to fit in 31 bits
+** (e.g. an index-key length bounded by SQLITE_MAX_LENGTH); it asserts
+** that's actually true rather than silently truncating.
+*/
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE int rowidCompare(rowid_t a, rowid_t b){
+    return int128CompareSigned(a, b);
+  }
+#else
+  static SQLITE_INLINE int rowidCompare(rowid_t a, rowid_t b){
+    return a<b ? -1 : a>b ? 1 : 0;
+  }
+#endif
+static SQLITE_INLINE int rowidEqual(rowid_t a, rowid_t b){ return rowidCompare(a,b)==0; }
+static SQLITE_INLINE int rowidLt(rowid_t a, rowid_t b){ return rowidCompare(a,b)<0; }
+static SQLITE_INLINE int rowidLe(rowid_t a, rowid_t b){ return rowidCompare(a,b)<=0; }
+static SQLITE_INLINE int rowidGt(rowid_t a, rowid_t b){ return rowidCompare(a,b)>0; }
+static SQLITE_INLINE int rowidGe(rowid_t a, rowid_t b){ return rowidCompare(a,b)>=0; }
+static SQLITE_INLINE int rowidIsNeg(rowid_t a){ return rowidLt(a, rowidFromI64(0)); }
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE rowid_t rowidAdd1(rowid_t a){ return int128Increment(a); }
+  static SQLITE_INLINE rowid_t rowidSub1(rowid_t a){ return int128Decrement(a); }
+#else
+  static SQLITE_INLINE rowid_t rowidAdd1(rowid_t a){ return a+1; }
+  static SQLITE_INLINE rowid_t rowidSub1(rowid_t a){ return a-1; }
+#endif
+static SQLITE_INLINE int rowidToInt(rowid_t x){
+  i64 v = rowidToI64(x);
+  assert( v==(i64)(int)v );
+  return (int)v;
+}
+
 typedef UINT32_TYPE u32;           /* 4-byte unsigned integer */
 typedef UINT16_TYPE u16;           /* 2-byte unsigned integer */
 typedef INT16_TYPE i16;            /* 2-byte signed integer */

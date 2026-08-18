@@ -1136,7 +1136,7 @@ sqlite_int64 sqlite3_last_insert_rowid(sqlite3 *db){
   }
 #endif
   sqlite3_mutex_enter(db->mutex);
-  iRet = db->lastRowid;
+  iRet = rowidTruncateToI64(db->lastRowid);
   sqlite3_mutex_leave(db->mutex);
   return iRet;
 }
@@ -1152,7 +1152,7 @@ void sqlite3_set_last_insert_rowid(sqlite3 *db, sqlite3_int64 iRowid){
   }
 #endif
   sqlite3_mutex_enter(db->mutex);
-  db->lastRowid = iRowid;
+  db->lastRowid = rowidFromI64(iRowid);
   sqlite3_mutex_leave(db->mutex);
 }
 

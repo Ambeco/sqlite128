@@ -123,7 +123,7 @@ struct VdbeCursor {
   Pgno pgnoRoot;          /* Root page of the open btree cursor */
   i16 nField;             /* Number of fields in the header */
   u16 nHdrParsed;         /* Number of header fields parsed so far */
-  i64 movetoTarget;       /* Argument to the deferred sqlite3BtreeMoveto() */
+  rowid_t movetoTarget;    /* Argument to the deferred sqlite3BtreeMoveto() */
   u32 *aOffset;           /* Pointer to aType[nField] */
   const u8 *aRow;         /* Data for the current row, if all on one page */
   u32 payloadSize;        /* Total number of bytes in the record */
