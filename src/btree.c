@@ -31,6 +31,17 @@
 */
 static const char zMagicHeader[] = SQLITE_FILE_HEADER;
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** The header string written instead of zMagicHeader once a rowid wider
+** than 64 bits has actually been written to this database. See
+** SQLITE_FILE_HEADER_WIDE's comment (btreeInt.h) for why this, and not
+** the file_format byte, is the mechanism that keeps a narrow build from
+** ever opening a wide-rowid file.
+*/
+static const char zMagicHeaderWide[] = SQLITE_FILE_HEADER_WIDE;
+#endif
+
 /*
 ** Set this global variable to 1 to enable tracing using the TRACE
 ** macro.
@@ -3345,10 +3356,26 @@ static int lockBtree(BtShared *pBt){
     rc = SQLITE_NOTADB;
     /* EVIDENCE-OF: R-43737-39999 Every valid SQLite database file begins
     ** with the following 16 bytes (in hex): 53 51 4c 69 74 65 20 66 6f 72 6d
-    ** 61 74 20 33 00. */
+    ** 61 74 20 33 00.
+    **
+    ** A SQLITE_128BIT_ROWID build also accepts zMagicHeaderWide, so it can
+    ** open a database that has had a >64-bit rowid written to it; every
+    ** other build (including any unmodified mainline SQLite, regardless of
+    ** version) only ever recognizes the standard header, which is exactly
+    ** the point -- see SQLITE_FILE_HEADER_WIDE's comment in btreeInt.h. */
+#ifdef SQLITE_128BIT_ROWID
+    if( memcmp(page1, zMagicHeader, 16)==0 ){
+      /* narrow: BTS_WIDE_ROWID left clear */
+    }else if( memcmp(page1, zMagicHeaderWide, 16)==0 ){
+      pBt->btsFlags |= BTS_WIDE_ROWID;
+    }else{
+      goto page1_init_failed;
+    }
+#else
     if( memcmp(page1, zMagicHeader, 16)!=0 ){
       goto page1_init_failed;
     }
+#endif
 
 #ifdef SQLITE_OMIT_WAL
     if( page1[18]>1 ){

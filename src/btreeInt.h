@@ -250,6 +250,32 @@ typedef struct CellInfo CellInfo;
 #endif
 
 /*
+** SQLITE_FILE_HEADER_WIDE is the page-1 header string written, instead
+** of SQLITE_FILE_HEADER, once a rowid wider than 64 bits has actually
+** been written somewhere in a SQLITE_128BIT_ROWID-build database (see
+** BTS_WIDE_ROWID). It must be exactly 16 bytes including the
+** zero-terminator, like SQLITE_FILE_HEADER, and it must never equal
+** SQLITE_FILE_HEADER.
+**
+** This -- not the file_format byte, not the BTREE_ROWID_FORMAT meta
+** value -- is the actual, durable guarantee that a build without
+** SQLITE_128BIT_ROWID (mainline SQLite included, any version, past or
+** future) refuses to open a wide-rowid file: mainline's own page-1
+** sanity check is a hardcoded byte-for-byte comparison against
+** "SQLite format 3\0", a string the file format specification promises
+** never changes -- changing it would break file compatibility for the
+** entire SQLite ecosystem. A numeric ceiling like SQLITE_MAX_FILE_FORMAT
+** is a convention mainline controls and could in principle raise some
+** day; this magic string is not. A SQLITE_128BIT_ROWID build accepts
+** *either* header when opening a file (see zMagicHeader/zMagicHeaderWide
+** in btree.c) so it keeps reading ordinary narrow-rowid databases too;
+** every other build only ever recognizes SQLITE_FILE_HEADER.
+*/
+#ifndef SQLITE_FILE_HEADER_WIDE /* 123456789 123456 */
+#  define SQLITE_FILE_HEADER_WIDE "SQLite fmt 128b"
+#endif
+
+/*
 ** Page type flags.  An ORed combination of these flags appear as the
 ** first byte of on-disk image of every BTree page.
 */
@@ -471,6 +497,13 @@ struct BtShared {
 #define BTS_NO_WAL           0x0020   /* Do not open write-ahead-log files */
 #define BTS_EXCLUSIVE        0x0040   /* pWriter has an exclusive lock */
 #define BTS_PENDING          0x0080   /* Waiting for read-locks to clear */
+#define BTS_WIDE_ROWID       0x0100   /* This file's page-1 header string is
+                                       ** zMagicHeaderWide, not zMagicHeader --
+                                       ** i.e. it was opened as a database
+                                       ** that has (or may have) a rowid
+                                       ** wider than 64 bits somewhere in it.
+                                       ** Only ever set under
+                                       ** SQLITE_128BIT_ROWID. */
 
 /*
 ** An instance of the following structure is used to hold information
