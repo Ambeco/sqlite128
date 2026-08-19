@@ -90,6 +90,11 @@ static SQLITE_INLINE sqlite3_uint128 int128FromDoubleUnsigned(double r){
   return (sqlite3_uint128)r;
 }
 
+/* Full 128x128 unsigned multiply, truncated (wrapped mod 2^128) to the
+** low 128 bits of the product. __uint128_t multiplication already
+** wraps this way, so this is just an alias. */
+#define int128MultiplyLow(a,b)   ((a)*(b))
+
 #else /* !SQLITE_USE_UINT128 */
 
 typedef union sqlite3_uint128 sqlite3_uint128;
@@ -189,6 +194,20 @@ static SQLITE_INLINE sqlite3_uint128 int128Multiply(u64 a, u64 b){
   return r;
 }
 
+/* Full 128x128 unsigned multiply, truncated (wrapped mod 2^128) to the
+** low 128 bits of the product. Schoolbook multiply of two 64-bit-limb
+** values: only the low 64 bits of the cross terms (a0*b1 + a1*b0) can
+** affect the low 128 bits of the result, since anything they carry
+** into bit 128 or beyond is discarded by the truncation anyway. */
+static SQLITE_INLINE sqlite3_uint128 int128MultiplyLow(
+  sqlite3_uint128 a,
+  sqlite3_uint128 b
+){
+  sqlite3_uint128 r = int128Multiply(a.quads[0], b.quads[0]);
+  r.quads[1] += a.quads[0]*b.quads[1] + a.quads[1]*b.quads[0];
+  return r;
+}
+
 /* Sign-extend a 64-bit signed integer into a two's-complement
 ** sqlite3_uint128. */
 static SQLITE_INLINE sqlite3_uint128 int128FromI64(i64 x){
@@ -227,6 +246,117 @@ static SQLITE_INLINE double int128ToDoubleSigned(sqlite3_uint128 x){
 static SQLITE_INLINE sqlite3_uint128 int128FromDoubleSigned(double r){
   if( r<0.0 ) return int128Negate(int128FromDoubleUnsigned(-r));
   return int128FromDoubleUnsigned(r);
+}
+
+/* Unsigned 128-bit division: dividend/divisor -> *pQuot, *pRem. divisor
+** must be nonzero (undefined -- infinite loop avoided but result is
+** meaningless -- if zero; callers must check first, same as SQLite's
+** existing 64-bit division opcodes do). Plain bit-at-a-time restoring
+** long division: not fast, but this is only reached for values that
+** overflow 64 bits in the first place, which is rare, and it is built
+** entirely out of the portable primitives above so it needs no
+** per-representation implementation. */
+static SQLITE_INLINE void int128DivModU(
+  sqlite3_uint128 dividend,
+  sqlite3_uint128 divisor,
+  sqlite3_uint128 *pQuot,
+  sqlite3_uint128 *pRem
+){
+  sqlite3_uint128 quot = int128FromU64(0);
+  sqlite3_uint128 rem = int128FromU64(0);
+  int i;
+  assert( !int128IsZero(divisor) );
+  for(i=127; i>=0; i--){
+    int bit = (int)(int128ToU64(int128ShiftRight(dividend, i)) & 1);
+    rem = int128ShiftLeft(rem, 1);
+    if( bit ) rem = int128Increment(rem);
+    if( int128Compare(rem, divisor)>=0 ){
+      rem = int128Sub(rem, divisor);
+      quot = int128Increment(int128ShiftLeft(quot, 1));
+    }else{
+      quot = int128ShiftLeft(quot, 1);
+    }
+  }
+  *pQuot = quot;
+  *pRem = rem;
+}
+
+/* Signed 128-bit division, truncating toward zero (same convention as
+** C's / and % on signed integers, and the same convention SQLite's
+** OP_Divide/OP_Remainder use for i64). divisor must be nonzero.
+**
+** Note: dividend==SMALLEST_INT128 (-2^127) && divisor==-1 is the one
+** input pair whose mathematical quotient (2^127) doesn't fit back into
+** a signed 128-bit result; this function does not special-case it (it
+** returns the wrapped/truncated bit pattern), matching how
+** int128DivModU()/negation behave everywhere else in this header --
+** callers needing overflow detection there should check for it
+** explicitly, the same way OP_Divide already does for the i64 case. */
+static SQLITE_INLINE void int128DivMod(
+  sqlite3_uint128 dividend,
+  sqlite3_uint128 divisor,
+  sqlite3_uint128 *pQuot,
+  sqlite3_uint128 *pRem
+){
+  int dn = int128IsNegative(dividend), vn = int128IsNegative(divisor);
+  sqlite3_uint128 ad = dn ? int128Negate(dividend) : dividend;
+  sqlite3_uint128 av = vn ? int128Negate(divisor) : divisor;
+  sqlite3_uint128 q, r;
+  int128DivModU(ad, av, &q, &r);
+  *pQuot = (dn!=vn) ? int128Negate(q) : q;
+  *pRem = dn ? int128Negate(r) : r;
+}
+
+/* Attempt to add/subtract/multiply the signed 128-bit value iB against
+** the other signed 128-bit integer at *pA and store the result in *pA.
+** Return 0 on success, or 1 (leaving *pA unchanged) on signed overflow.
+** Mirrors sqlite3AddInt64()/sqlite3SubInt64()/sqlite3MulInt64() (util.c)
+** at 128 bits, for OP_Add/OP_Subtract/OP_Multiply (Phase 6d) to fall
+** back to floating-point on overflow the same way the i64 path does.
+*/
+static SQLITE_INLINE int int128AddOverflow(sqlite3_uint128 *pA, sqlite3_uint128 iB){
+  sqlite3_uint128 iA = *pA;
+  sqlite3_uint128 r = int128Add(iA, iB);
+  int an = int128IsNegative(iA), bn = int128IsNegative(iB);
+  if( an==bn && int128IsNegative(r)!=an ) return 1;
+  *pA = r;
+  return 0;
+}
+static SQLITE_INLINE int int128SubOverflow(sqlite3_uint128 *pA, sqlite3_uint128 iB){
+  sqlite3_uint128 smallest = int128ShiftLeft(int128FromU64(1), 127); /* -2^127 */
+  if( int128Compare(iB, smallest)==0 ){
+    if( !int128IsNegative(*pA) ) return 1;
+    *pA = int128Sub(*pA, iB);
+    return 0;
+  }
+  return int128AddOverflow(pA, int128Negate(iB));
+}
+static SQLITE_INLINE int int128MulOverflow(sqlite3_uint128 *pA, sqlite3_uint128 iB){
+  sqlite3_uint128 iA = *pA;
+  sqlite3_uint128 smallest = int128ShiftLeft(int128FromU64(1), 127);  /* -2^127 */
+  sqlite3_uint128 largest = int128Decrement(smallest);                /* 2^127-1, i.e. ~smallest */
+  sqlite3_uint128 q, r;
+  if( int128IsZero(iA) || int128IsZero(iB) ){
+    *pA = int128FromU64(0);
+    return 0;
+  }
+  if( !int128IsNegative(iB) ){
+    int128DivMod(largest, iB, &q, &r);
+    if( int128CompareSigned(iA, q)>0 ) return 1;
+    int128DivMod(smallest, iB, &q, &r);
+    if( int128CompareSigned(iA, q)<0 ) return 1;
+  }else if( !int128IsNegative(iA) ){
+    int128DivMod(smallest, iA, &q, &r);
+    if( int128CompareSigned(iB, q)<0 ) return 1;
+  }else{
+    /* both iA and iB negative */
+    if( int128Compare(iB, smallest)==0 ) return 1;
+    if( int128Compare(iA, smallest)==0 ) return 1;
+    int128DivMod(largest, int128Negate(iB), &q, &r);
+    if( int128CompareSigned(int128Negate(iA), q)>0 ) return 1;
+  }
+  *pA = int128MultiplyLow(iA, iB);
+  return 0;
 }
 
 #endif /* SQLITE_INT128_H */
