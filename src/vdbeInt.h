@@ -236,6 +236,16 @@ struct sqlite3_value {
     int nZero;          /* Extra zero bytes when MEM_Zero and MEM_Blob set */
     const char *zPType; /* Pointer type when MEM_Term|MEM_Subtype|MEM_Null */
     FuncDef *pDef;      /* Used only when flags==MEM_Agg */
+#ifdef SQLITE_128BIT_ROWID
+    sqlite3_uint128 i128; /* Integer value when MEM_Int128 is set in flags.
+                          ** Two's-complement, same signedness convention as
+                          ** Mem.u.i: negative values have the top bit of
+                          ** i128 set (see rowidFromI64()/rowidToI64() in
+                          ** sqliteInt.h for the analogous rowid_t
+                          ** convention this mirrors). This member widens
+                          ** MemValue's size only in a SQLITE_128BIT_ROWID
+                          ** build -- a default build's Mem is unaffected. */
+#endif
   } u;
   char *z;            /* String or BLOB value */
   int n;              /* Number of characters in string value, excluding '\0' */
@@ -318,7 +328,22 @@ struct sqlite3_value {
 /* Extra bits that modify the meanings of the core datatypes above
 */
 #define MEM_FromBind  0x0040   /* Value originates from sqlite3_bind() */
- /*                   0x0080   // Available */
+#define MEM_Int128    0x0080   /* Integer stored in Mem.u.i128 (128-bit).
+                                ** Only ever set in a SQLITE_128BIT_ROWID
+                                ** build -- see Phase 6 (sqliteInt.h's
+                                ** rowid_t/int128 helpers) for how a
+                                ** default build's plain MEM_Int continues
+                                ** to cover every case there. This bit is
+                                ** NOT part of MEM_AffMask/MEM_TypeMask
+                                ** yet: as of this commit it is only
+                                ** constructible/readable via
+                                ** sqlite3VdbeMemSetInt128()/
+                                ** sqlite3VdbeMemInt128Value() (vdbemem.c)
+                                ** and is not yet recognized by
+                                ** sqlite3_value_type(), comparison,
+                                ** arithmetic, CAST, or the record
+                                ** serial-type encoding -- those are later,
+                                ** separate sub-phases. */
 #define MEM_Cleared   0x0100   /* NULL set by OP_Null, not from data */
 #define MEM_Term      0x0200   /* String in Mem.z is zero terminated */
 #define MEM_Zero      0x0400   /* Mem.i contains count of 0s appended to blob */
@@ -643,6 +668,10 @@ int sqlite3VdbeMemNulTerminate(Mem*);
 int sqlite3VdbeMemSetStr(Mem*, const char*, i64, u8, void(*)(void*));
 int sqlite3VdbeMemSetText(Mem*, const char*, i64, void(*)(void*));
 void sqlite3VdbeMemSetInt64(Mem*, i64);
+#ifdef SQLITE_128BIT_ROWID
+void sqlite3VdbeMemSetInt128(Mem*, sqlite3_uint128);
+sqlite3_uint128 sqlite3VdbeMemInt128Value(const Mem*);
+#endif
 #ifdef SQLITE_OMIT_FLOATING_POINT
 # define sqlite3VdbeMemSetDouble sqlite3VdbeMemSetInt64
 #else

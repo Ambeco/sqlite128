@@ -1055,6 +1055,41 @@ void sqlite3VdbeMemSetInt64(Mem *pMem, i64 val){
   }
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** sqlite3VdbeMemSetInt128()/sqlite3VdbeMemInt128Value() are the Phase 6a
+** foundation for a 128-bit-integer Mem representation: construction and
+** access only. Nothing yet produces a MEM_Int128 value from ordinary SQL
+** (no literal, arithmetic op, or column read sets this flag) and nothing
+** yet consumes one generically (sqlite3_value_type(), comparison,
+** CAST, typeof(), and the record serial-type encoding all still only
+** recognize MEM_Int) -- those come in the later Phase 6 sub-phases.
+** Calling these two functions is presently the only way a MEM_Int128
+** value comes into being or gets read back out.
+*/
+
+/*
+** Delete any previous value and set the value stored in *pMem to val,
+** manifest type INTEGER, 128-bit representation.
+*/
+void sqlite3VdbeMemSetInt128(Mem *pMem, sqlite3_uint128 val){
+  sqlite3VdbeMemSetNull(pMem);
+  pMem->u.i128 = val;
+  pMem->flags = MEM_Int128;
+}
+
+/*
+** Return the 128-bit integer value of pMem. pMem must have MEM_Int128
+** set (an ordinary MEM_Int value is NOT widened here -- that
+** conversion, if wanted, belongs to a later Phase 6 sub-phase once
+** general arithmetic/coercion between the two representations exists).
+*/
+sqlite3_uint128 sqlite3VdbeMemInt128Value(const Mem *pMem){
+  assert( pMem->flags & MEM_Int128 );
+  return pMem->u.i128;
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 /*
 ** Set the iIdx'th entry of array aMem[] to contain integer value val.
 */
