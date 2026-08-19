@@ -1961,6 +1961,107 @@ case OP_Remainder: {           /* same as TK_REM, in1, in2, out3 */
   pIn2 = &aMem[pOp->p2];
   type2 = pIn2->flags;
   pOut = &aMem[pOp->p3];
+#ifdef SQLITE_128BIT_ROWID
+  /* Phase 6d: if either operand is a 128-bit integer, do the math at 128
+  ** bits instead of falling into the ordinary MEM_Int/numericType() path
+  ** below, which does not know about MEM_Int128 (Phase 6f) and would
+  ** either misroute it or read Mem.u.i/Mem.u.r out of the wrong union
+  ** member. The other operand, if not itself MEM_Int128, is widened:
+  ** MEM_Int/MEM_IntReal exactly (int128FromI64), MEM_Real/anything else
+  ** approximately (through a double), same precision trade-off the
+  ** ordinary int/real mixed math below already makes. */
+  if( ((type1|type2) & MEM_Int128)!=0 ){
+    sqlite3_uint128 wA, wB;
+    int rcOverflow = 0;
+
+    if( (type1 & MEM_Int128)!=0 ){
+      wA = pIn1->u.i128;
+    }else if( (type1 & (MEM_Int|MEM_IntReal))!=0 ){
+      wA = int128FromI64(pIn1->u.i);
+    }else if( (type1 & MEM_Real)!=0 ){
+      wA = int128FromDoubleSigned(pIn1->u.r);
+    }else if( (type1 & MEM_Null)!=0 || (type2 & MEM_Null)!=0 ){
+      goto arithmetic_result_is_null;
+    }else{
+      wA = int128FromDoubleSigned(sqlite3VdbeRealValue(pIn1));
+    }
+    if( (type2 & MEM_Int128)!=0 ){
+      wB = pIn2->u.i128;
+    }else if( (type2 & (MEM_Int|MEM_IntReal))!=0 ){
+      wB = int128FromI64(pIn2->u.i);
+    }else if( (type2 & MEM_Real)!=0 ){
+      wB = int128FromDoubleSigned(pIn2->u.r);
+    }else if( (type1 & MEM_Null)!=0 || (type2 & MEM_Null)!=0 ){
+      goto arithmetic_result_is_null;
+    }else{
+      wB = int128FromDoubleSigned(sqlite3VdbeRealValue(pIn2));
+    }
+
+    switch( pOp->opcode ){
+      case OP_Add:       rcOverflow = int128AddOverflow(&wB, wA);  break;
+      case OP_Subtract:  rcOverflow = int128SubOverflow(&wB, wA);  break;
+      case OP_Multiply:  rcOverflow = int128MulOverflow(&wB, wA);  break;
+      case OP_Divide: {
+        sqlite3_uint128 q, r;
+        sqlite3_uint128 smallest128 = int128ShiftLeft(int128FromU64(1),127);
+        if( int128IsZero(wA) ) goto arithmetic_result_is_null;
+        if( int128Compare(wA,int128FromI64(-1))==0
+         && int128Compare(wB,smallest128)==0 ){
+          rcOverflow = 1;  /* -2^127 / -1 doesn't fit back in 128 bits */
+        }else{
+          int128DivMod(wB, wA, &q, &r);
+          wB = q;
+        }
+        break;
+      }
+      default: {        /* OP_Remainder -- can never overflow */
+        sqlite3_uint128 q, r;
+        if( int128IsZero(wA) ) goto arithmetic_result_is_null;
+        if( int128Compare(wA,int128FromI64(-1))==0 ) wA = int128FromU64(1);
+        int128DivMod(wB, wA, &q, &r);
+        wB = r;
+        break;
+      }
+    }
+
+    if( rcOverflow ){
+      /* Overflow: fall back to floating point, same policy as the 64-bit
+      ** path's "goto fp_math" -- but computed locally from wA/wB (already
+      ** widened above) rather than by jumping to fp_math, since that label
+      ** re-reads pIn1/pIn2 via sqlite3VdbeRealValue(), which does not yet
+      ** understand MEM_Int128 (Phase 6f). */
+      double rA128 = int128ToDoubleSigned(wA);
+      double rB128 = int128ToDoubleSigned(
+          (type2 & MEM_Int128)!=0 ? pIn2->u.i128 :
+          (type2 & (MEM_Int|MEM_IntReal))!=0 ? int128FromI64(pIn2->u.i) :
+          (type2 & MEM_Real)!=0 ? int128FromDoubleSigned(pIn2->u.r) :
+          int128FromDoubleSigned(sqlite3VdbeRealValue(pIn2)));
+      switch( pOp->opcode ){
+        case OP_Add:       rB128 += rA128;  break;
+        case OP_Subtract:  rB128 -= rA128;  break;
+        case OP_Multiply:  rB128 *= rA128;  break;
+        default:           rB128 /= rA128;  break;  /* OP_Divide; the
+                                                      ** rA128==0 case was
+                                                      ** already excluded
+                                                      ** above.
+                                                      ** OP_Remainder never
+                                                      ** sets rcOverflow. */
+      }
+#ifdef SQLITE_OMIT_FLOATING_POINT
+      pOut->u.i = (i64)rB128;
+      MemSetTypeFlag(pOut, MEM_Int);
+#else
+      if( sqlite3IsNaN(rB128) ){
+        goto arithmetic_result_is_null;
+      }
+      pOut->u.r = rB128;
+      MemSetTypeFlag(pOut, MEM_Real);
+#endif
+    }else{
+      sqlite3VdbeMemSetInt128(pOut, wB);
+    }
+  }else
+#endif /* SQLITE_128BIT_ROWID */
   if( (type1 & type2 & MEM_Int)!=0 ){
 int_math:
     iA = pIn1->u.i;
