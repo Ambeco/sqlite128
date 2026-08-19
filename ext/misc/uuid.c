@@ -11,11 +11,13 @@
 ******************************************************************************
 **
 ** This SQLite extension implements functions that handling RFC-4122 UUIDs
-** Three SQL functions are implemented:
+** Four SQL functions are implemented:
 **
 **     uuid()        - generate a version 4 UUID as a string
 **     uuid_str(X)   - convert a UUID X into a well-formed UUID string
 **     uuid_blob(X)  - convert a UUID X into a 16-byte blob
+**     uuid_int(X)   - convert a UUID X into its canonical 128-bit integer
+**                     representation, as a 16-byte big-endian blob
 **
 ** The output from uuid() and uuid_str(X) are always well-formed RFC-4122
 ** UUID strings in this format:
@@ -57,6 +59,33 @@
 **
 ** If the X input string has too few or too many digits or contains
 ** stray characters other than {, }, or -, then NULL is returned.
+**
+** uuid_int(X) accepts the same inputs as uuid_str()/uuid_blob() (a
+** UUID string in any of the accepted forms above, or an exact 16-byte
+** blob) and returns the UUID's canonical 128-bit-integer representation:
+** the same 16 bytes uuid_blob() returns, in the same big-endian
+** ("network") byte order. Network byte order isn't an arbitrary choice
+** here -- comparing two such blobs byte-by-byte (memcmp order, which is
+** also SQLite's default BLOB collation) gives exactly the same result
+** as comparing the two 128-bit magnitudes numerically, so this
+** representation is both the UUID's defined byte layout *and* directly
+** usable wherever an ordered/sortable 128-bit unsigned integer is
+** needed -- notably as a wide rowid value in a build with
+** SQLITE_128BIT_ROWID enabled.
+**
+** uuid_int() and uuid_blob() therefore currently produce byte-identical
+** output; they are kept as separate, separately-documented functions
+** because they answer different questions ("give me this UUID's raw
+** bytes" vs. "give me this UUID as a 128-bit integer") and because this
+** extension has no way to expose a value as anything other than one of
+** SQLite's existing fundamental types -- there is no SQL-visible
+** 128-bit integer type for uuid_int() to return instead (see
+** src/sqliteInt128.h's sqlite3_uint128 for the core-internal type this
+** models; that header is not, and must not be, visible to this
+** extension, since it is a standalone loadable module built only
+** against the public sqlite3.h/sqlite3ext.h API surface, and
+** sqlite3_uint128's exact layout depends on core build flags an
+** extension has no visibility into).
 */
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
@@ -207,6 +236,26 @@ static void sqlite3UuidBlobFunc(
   sqlite3_result_blob(context, pBlob, 16, SQLITE_TRANSIENT);
 }
 
+/* Implementation of uuid_int() -- see the block comment near the top of
+** this file for why this currently returns the same bytes as
+** uuid_blob(): it's the canonical big-endian 128-bit-integer
+** representation, kept as its own function/name for documentation and
+** forward-compatibility (e.g. with SQLITE_128BIT_ROWID's wide rowid
+** support), not because the bytes differ.
+*/
+static void sqlite3UuidIntFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  unsigned char aBlob[16];
+  const unsigned char *pBlob;
+  (void)argc;
+  pBlob = sqlite3UuidInputToBlob(argv[0], aBlob);
+  if( pBlob==0 ) return;
+  sqlite3_result_blob(context, pBlob, 16, SQLITE_TRANSIENT);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
@@ -229,6 +278,11 @@ int sqlite3_uuid_init(
     rc = sqlite3_create_function(db, "uuid_blob", 1,
                        SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
                        0, sqlite3UuidBlobFunc, 0, 0);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_create_function(db, "uuid_int", 1,
+                       SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+                       0, sqlite3UuidIntFunc, 0, 0);
   }
   return rc;
 }
