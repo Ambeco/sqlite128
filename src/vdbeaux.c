@@ -3993,6 +3993,18 @@ const u8 sqlite3SmallTypeSizes[128] = {
 ** Return the length of the data corresponding to the supplied serial-type.
 */
 u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
+#ifdef SQLITE_128BIT_ROWID
+  /* Serial type 11 is repurposed under SQLITE_128BIT_ROWID as a 16-byte
+  ** 128-bit integer (see sqlite3VdbeSerialGet()'s case 11) rather than
+  ** the generic "reserved, 0 bytes" every other build treats it as.
+  ** Special-cased here rather than in the shared sqlite3SmallTypeSizes
+  ** table itself, so every *other* caller of that table (e.g. the
+  ** record-comparison fast path, sqlite3VdbeIdxRowid's index-rowid
+  ** length lookup) is completely unaffected by this build flag -- only
+  ** callers that go through this wrapper (or the one below) see the
+  ** new length. */
+  if( serial_type==11 ) return 16;
+#endif
   if( serial_type>=128 ){
     return (serial_type-12)/2;
   }else{
@@ -4003,7 +4015,10 @@ u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
 }
 u8 sqlite3VdbeOneByteSerialTypeLen(u8 serial_type){
   assert( serial_type<128 );
-  return sqlite3SmallTypeSizes[serial_type]; 
+#ifdef SQLITE_128BIT_ROWID
+  if( serial_type==11 ) return 16;
+#endif
+  return sqlite3SmallTypeSizes[serial_type];
 }
 
 /*
@@ -4096,7 +4111,32 @@ void sqlite3VdbeSerialGet(
       pMem->u.nZero = 0;
       return;
     }
+#ifdef SQLITE_128BIT_ROWID
+    case 11: { /* 16-byte, 128-bit twos-complement integer.
+               ** SQLITE_128BIT_ROWID only -- see Phase 6b. A build
+               ** without SQLITE_128BIT_ROWID falls through to the
+               ** default 'reserved, treat as NULL' case below,
+               ** unchanged from before this feature existed; only a
+               ** wide-rowid-capable build can ever actually write this
+               ** serial type (see the OP_MakeRecord encoder, vdbe.c),
+               ** so a narrow build should never encounter one for real. */
+      /* Big-endian on the wire, like every other multi-byte integer
+      ** serial type here: the high 8 bytes (the sign-bearing half, for
+      ** twos-complement) come first. Built via the portable int128*
+      ** helpers (sqliteInt128.h) rather than reaching into
+      ** sqlite3_uint128's representation directly, since that
+      ** representation differs between the SQLITE_USE_UINT128 (native
+      ** __uint128_t) and portable (quads[2] struct) builds. */
+      u64 hi = sqlite3Get8byte(buf);
+      u64 lo = sqlite3Get8byte(buf+8);
+      pMem->u.i128 = int128Add(int128ShiftLeft(int128FromU64(hi), 64),
+                                int128FromU64(lo));
+      pMem->flags = MEM_Int128;
+      return;
+    }
+#else
     case 11:   /* Reserved for future use */
+#endif
     case 0: {  /* Null */
       /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
       pMem->flags = MEM_Null;

@@ -3255,9 +3255,25 @@ op_column_restart:
     zData = pC->aRow + aOffset[p2];
     switch( t ){
       case 0:
+#ifndef SQLITE_128BIT_ROWID
       case 11:
+#endif
         pDest->flags = MEM_Null;
         break;
+#ifdef SQLITE_128BIT_ROWID
+      case 11: {
+        /* 16-byte 128-bit integer. This mirrors sqlite3VdbeSerialGet()'s
+        ** case 11 (vdbeaux.c) -- this switch is that function's inlined,
+        ** OP_Column-optimized twin (see the comment above this switch),
+        ** so both copies of the decode logic have to stay in sync. */
+        u64 hi = sqlite3Get8byte(zData);
+        u64 lo = sqlite3Get8byte(zData+8);
+        pDest->u.i128 = int128Add(int128ShiftLeft(int128FromU64(hi), 64),
+                                   int128FromU64(lo));
+        pDest->flags = MEM_Int128;
+        break;
+      }
+#endif
       case 1:
         pDest->u.i = ONE_BYTE_INT(zData);
         pDest->flags = MEM_Int;
@@ -3693,6 +3709,19 @@ case OP_MakeRecord: {
         pRec->uTemp = 0;
       }
       nHdr++;
+#ifdef SQLITE_128BIT_ROWID
+    }else if( pRec->flags & MEM_Int128 ){
+      /* Serial type 11: 16-byte 128-bit integer. Unlike the MEM_Int
+      ** branch below, there is no variable-width choice to make here --
+      ** a MEM_Int128 value always needs the full 16 bytes, since (unlike
+      ** a plain 64-bit MEM_Int) there is no cheaper narrower encoding
+      ** available for it to fall back to without losing the very
+      ** property (127 bits+sign of range) that distinguishes it from an
+      ** ordinary MEM_Int in the first place. */
+      nHdr++;
+      nData += 16;
+      pRec->uTemp = 11;
+#endif
     }else if( pRec->flags & (MEM_Int|MEM_IntReal) ){
       /* Figure out whether to use 1, 2, 4, 6 or 8 bytes. */
       i64 i = pRec->u.i;
@@ -3898,6 +3927,22 @@ case OP_MakeRecord: {
       }
     }else if( serial_type<0x80 ){
       *(zHdr++) = serial_type;
+#ifdef SQLITE_128BIT_ROWID
+      if( serial_type==11 ){
+        /* 16-byte 128-bit integer, big-endian (high half first), same
+        ** convention as every other multi-byte integer serial type
+        ** above -- see sqlite3VdbeSerialGet()'s case 11 (vdbeaux.c) for
+        ** the matching decode. Reads back out via the portable int128*
+        ** helpers rather than sqlite3_uint128's representation directly
+        ** (see that decode site's comment for why). */
+        u64 hi = int128ToU64(int128ShiftRight(pRec->u.i128, 64));
+        u64 lo = int128ToU64(pRec->u.i128);
+        int ii;
+        for(ii=0; ii<8; ii++){ zPayload[ii]   = (u8)(hi>>(56-8*ii)); }
+        for(ii=0; ii<8; ii++){ zPayload[8+ii] = (u8)(lo>>(56-8*ii)); }
+        zPayload += 16;
+      }else
+#endif
       if( serial_type>=14 && pRec->n>0 ){
         assert( pRec->z!=0 );
         memcpy(zPayload, pRec->z, pRec->n);
