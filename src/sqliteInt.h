@@ -5574,8 +5574,8 @@ int sqlite3VListNameToNum(VList*,const char*,int);
 */
 int sqlite3PutVarint(unsigned char*, u64);
 u8 sqlite3GetVarint(const unsigned char *, u64 *);
-int sqlite3PutVarintRowid(unsigned char*, rowid_t);
-u8 sqlite3GetVarintRowid(const unsigned char*, rowid_t*);
+int sqlite3PutVarintRowid(unsigned char*, rowid_t, int bWide);
+u8 sqlite3GetVarintRowid(const unsigned char*, rowid_t*, int bWide);
 i64 sqlite3VarintValue(const unsigned char*);
 u8 sqlite3GetVarint32(const unsigned char *, u32 *);
 int sqlite3VarintLen(u64 v);

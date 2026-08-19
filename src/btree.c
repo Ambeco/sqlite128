@@ -1284,10 +1284,8 @@ static void btreeParseCellPtrNoPayload(
   assert( sqlite3_mutex_held(pPage->pBt->mutex) );
   assert( pPage->leaf==0 );
   assert( pPage->childPtrSize==4 );
-#ifndef SQLITE_DEBUG
-  UNUSED_PARAMETER(pPage);
-#endif
-  pInfo->nSize = 4 + sqlite3GetVarintRowid(&pCell[4], &pInfo->nKey);
+  pInfo->nSize = 4 + sqlite3GetVarintRowid(&pCell[4], &pInfo->nKey,
+                          (pPage->pBt->btsFlags & BTS_WIDE_ROWID)!=0);
   pInfo->nPayload = 0;
   pInfo->nLocal = 0;
   pInfo->pPayload = 0;
@@ -1325,23 +1323,31 @@ static void btreeParseCellPtr(
   }
   pIter++;
 
-  /* The next block of code is equivalent to:
-  **
-  **     pIter += sqlite3GetVarint(pIter, (u64*)&pInfo->nKey);
-  **
-  ** The code is inlined and the loop is unrolled for performance.
-  ** This routine is a high-runner.
-  */
-  iKey = *pIter;
-  if( iKey>=0x80 ){
-    u8 x;
-    iKey = (iKey<<7) ^ (x = *++pIter);
-    if( x>=0x80 ){
+  if( (pPage->pBt->btsFlags & BTS_WIDE_ROWID)!=0 ){
+    /* A wide-flagged file's cells are never narrow-encoded (see
+    ** putVarint128()'s comment, util.c), so the inlined fast path below
+    ** -- which can only ever produce a 9-byte-max, <=64-bit value --
+    ** must not run against this cell. This isn't a hot path (a
+    ** SQLITE_128BIT_ROWID build only takes it for a database that
+    ** actually opted into wide rowids), so an ordinary function call is
+    ** fine here. */
+    pIter += sqlite3GetVarintRowid(pIter, &pInfo->nKey, 1);
+  }else{
+    /* The next block of code is equivalent to:
+    **
+    **     pIter += sqlite3GetVarint(pIter, (u64*)&pInfo->nKey);
+    **
+    ** The code is inlined and the loop is unrolled for performance.
+    ** This routine is a high-runner.
+    */
+    iKey = *pIter;
+    if( iKey>=0x80 ){
+      u8 x;
       iKey = (iKey<<7) ^ (x = *++pIter);
       if( x>=0x80 ){
-        iKey = (iKey<<7) ^ 0x10204000 ^ (x = *++pIter);
+        iKey = (iKey<<7) ^ (x = *++pIter);
         if( x>=0x80 ){
-          iKey = (iKey<<7) ^ 0x4000 ^ (x = *++pIter);
+          iKey = (iKey<<7) ^ 0x10204000 ^ (x = *++pIter);
           if( x>=0x80 ){
             iKey = (iKey<<7) ^ 0x4000 ^ (x = *++pIter);
             if( x>=0x80 ){
@@ -1349,28 +1355,31 @@ static void btreeParseCellPtr(
               if( x>=0x80 ){
                 iKey = (iKey<<7) ^ 0x4000 ^ (x = *++pIter);
                 if( x>=0x80 ){
-                  iKey = (iKey<<8) ^ 0x8000 ^ (*++pIter);
+                  iKey = (iKey<<7) ^ 0x4000 ^ (x = *++pIter);
+                  if( x>=0x80 ){
+                    iKey = (iKey<<8) ^ 0x8000 ^ (*++pIter);
+                  }
                 }
               }
             }
           }
+        }else{
+          iKey ^= 0x204000;
         }
       }else{
-        iKey ^= 0x204000;
+        iKey ^= 0x4000;
       }
-    }else{
-      iKey ^= 0x4000;
     }
-  }
-  pIter++;
+    pIter++;
 
-  /* This inlined fast path only ever decodes the standard 9-byte-max
-  ** varint (see the block comment above), so it can never produce a
-  ** value wider than 64 bits -- it is exactly the "narrow" codec that
-  ** sqlite3GetVarintRowid() also implements, just unrolled for speed.
-  ** rowidFromI64() sign-extends into rowid_t at no cost in a build
-  ** where rowid_t is still just i64. */
-  pInfo->nKey = rowidFromI64(*(i64*)&iKey);
+    /* This inlined fast path only ever decodes the standard 9-byte-max
+    ** varint (see the block comment above), so it can never produce a
+    ** value wider than 64 bits -- it is exactly the "narrow" codec that
+    ** sqlite3GetVarintRowid() also implements, just unrolled for speed.
+    ** rowidFromI64() sign-extends into rowid_t at no cost in a build
+    ** where rowid_t is still just i64. */
+    pInfo->nKey = rowidFromI64(*(i64*)&iKey);
+  }
   pInfo->nPayload = (u32)nPayload;
   pInfo->pPayload = pIter;
   testcase( nPayload==pPage->maxLocal );
@@ -3358,14 +3367,26 @@ static int lockBtree(BtShared *pBt){
     ** with the following 16 bytes (in hex): 53 51 4c 69 74 65 20 66 6f 72 6d
     ** 61 74 20 33 00.
     **
-    ** A SQLITE_128BIT_ROWID build also accepts zMagicHeaderWide, so it can
-    ** open a database that has had a >64-bit rowid written to it; every
+    ** A SQLITE_128BIT_ROWID build also accepts zMagicHeaderWide; every
     ** other build (including any unmodified mainline SQLite, regardless of
     ** version) only ever recognizes the standard header, which is exactly
-    ** the point -- see SQLITE_FILE_HEADER_WIDE's comment in btreeInt.h. */
+    ** the point -- see SQLITE_FILE_HEADER_WIDE's comment in btreeInt.h.
+    **
+    ** Wideness is a whole-database property fixed permanently at creation
+    ** (see newDatabase()), never flipped in place -- a narrow rowid cell
+    ** and a wide one are never mixed in the same file. That's what lets
+    ** the wide codec safely be a genuine extension of the narrow varint
+    ** format (see sqlite3GetVarintRowid()/sqlite3PutVarintRowid() in
+    ** util.c) without any risk of misparsing old data: a wide-flagged
+    ** file can never contain a cell a narrow encoder wrote. A
+    ** SQLITE_128BIT_ROWID build that opens a *narrow* (legacy) file
+    ** forces it read-only instead -- it can inspect and migrate data out
+    ** of such a file via ordinary SQL (ATTACH/INSERT..SELECT/backup) into
+    ** a fresh wide database, but never writes narrow-format rowid cells
+    ** itself. */
 #ifdef SQLITE_128BIT_ROWID
     if( memcmp(page1, zMagicHeader, 16)==0 ){
-      /* narrow: BTS_WIDE_ROWID left clear */
+      pBt->btsFlags |= BTS_LEGACY_NARROW;  /* legacy narrow file: no writes */
     }else if( memcmp(page1, zMagicHeaderWide, 16)==0 ){
       pBt->btsFlags |= BTS_WIDE_ROWID;
     }else{
@@ -3500,9 +3521,21 @@ static int lockBtree(BtShared *pBt){
   ** 17 bytes long, 0 to N bytes of payload, and an optional 4 byte overflow
   ** page pointer.
   */
+  /* maxLocal/minLocal (above) are for index b-trees, whose cells never
+  ** contain a rowid key (see btreeInt.h's Table-vs-Index field-usage
+  ** table), so rowid width doesn't affect them. maxLeaf/minLeaf are for
+  ** table (intkey) b-trees, whose cells do -- widen the 35-byte budget's
+  ** worst-case key-varint allowance from 9 bytes (narrow) to 19 (wide,
+  ** see putVarint128()'s comment in util.c) so a wide file's fanout
+  ** guarantee still holds. */
   pBt->maxLocal = (u16)((pBt->usableSize-12)*64/255 - 23);
   pBt->minLocal = (u16)((pBt->usableSize-12)*32/255 - 23);
+#ifdef SQLITE_128BIT_ROWID
+  pBt->maxLeaf = (u16)(pBt->usableSize - 35
+                        - (((pBt->btsFlags & BTS_WIDE_ROWID)!=0) ? 10 : 0));
+#else
   pBt->maxLeaf = (u16)(pBt->usableSize - 35);
+#endif
   pBt->minLeaf = (u16)((pBt->usableSize-12)*32/255 - 23);
   if( pBt->maxLocal>127 ){
     pBt->max1bytePayload = 127;
@@ -3583,8 +3616,19 @@ static int newDatabase(BtShared *pBt){
   data = pP1->aData;
   rc = sqlite3PagerWrite(pP1->pDbPage);
   if( rc ) return rc;
+#ifdef SQLITE_128BIT_ROWID
+  /* A SQLITE_128BIT_ROWID build never writes a narrow-format rowid cell
+  ** (see BTS_LEGACY_NARROW), so every database it creates is wide from
+  ** its very first byte -- there is no "upgrade" event, ever, for a
+  ** brand new file. Wideness is a whole-database property fixed
+  ** permanently here at creation. */
+  memcpy(data, zMagicHeaderWide, sizeof(zMagicHeaderWide));
+  assert( sizeof(zMagicHeaderWide)==16 );
+  pBt->btsFlags |= BTS_WIDE_ROWID;
+#else
   memcpy(data, zMagicHeader, sizeof(zMagicHeader));
   assert( sizeof(zMagicHeader)==16 );
+#endif
   data[16] = (u8)((pBt->pageSize>>8)&0xff);
   data[17] = (u8)((pBt->pageSize>>16)&0xff);
   data[18] = 1;
@@ -3597,6 +3641,12 @@ static int newDatabase(BtShared *pBt){
   memset(&data[24], 0, 100-24);
   zeroPage(pP1, PTF_INTKEY|PTF_LEAF|PTF_LEAFDATA );
   pBt->btsFlags |= BTS_PAGESIZE_FIXED;
+#ifdef SQLITE_128BIT_ROWID
+  /* BTREE_ROWID_FORMAT: secondary, informational signal that this is a
+  ** wide-rowid database (the page-1 magic header is the mechanism that
+  ** actually matters for refusing to open -- see BTS_WIDE_ROWID). */
+  put4byte(&data[36 + (BTREE_ROWID_FORMAT-1)*4], 1);
+#endif
 #ifndef SQLITE_OMIT_AUTOVACUUM
   assert( pBt->autoVacuum==1 || pBt->autoVacuum==0 );
   assert( pBt->incrVacuum==1 || pBt->incrVacuum==0 );
@@ -3686,6 +3736,16 @@ static SQLITE_NOINLINE int btreeBeginTrans(
 
   /* Write transactions are not possible on a read-only database */
   if( (pBt->btsFlags & BTS_READ_ONLY)!=0 && wrflag ){
+    rc = SQLITE_READONLY;
+    goto trans_begun;
+  }
+
+  /* Nor on a legacy narrow-rowid file opened by a SQLITE_128BIT_ROWID
+  ** build (see BTS_LEGACY_NARROW's comment, btreeInt.h): such a build
+  ** never writes a narrow-format rowid cell, so it never writes to this
+  ** file at all. Read the data out via ordinary SQL into a fresh (wide)
+  ** database instead. */
+  if( (pBt->btsFlags & BTS_LEGACY_NARROW)!=0 && wrflag ){
     rc = SQLITE_READONLY;
     goto trans_begun;
   }
@@ -5951,7 +6011,7 @@ int sqlite3BtreeTableMoveto(
     assert( biasRight==0 || biasRight==1 );
     idx = upr>>(1-biasRight); /* idx = biasRight ? upr : (lwr+upr)/2; */
     for(;;){
-      i64 nCellKey;
+      rowid_t nCellKey;
       pCell = findCellPastPtr(pPage, idx);
       if( pPage->intKeyLeaf ){
         while( 0x80 <= *(pCell++) ){
@@ -5960,27 +6020,32 @@ int sqlite3BtreeTableMoveto(
           }
         }
       }
-      /* This binary search only ever runs against narrow (<=64-bit) table
-      ** btrees -- sqlite3VarintValue() is the legacy 9-byte-max codec, the
-      ** same one sqlite3GetVarintRowid() implements (see btree.c's cell
-      ** parsers). A wide-rowid database uses a different on-disk codec and
-      ** cannot reach this loop; see Phase 4's wide-codec work. */
-      nCellKey = sqlite3VarintValue(pCell);
-      if( rowidLt(rowidFromI64(nCellKey),intKey) ){
+      /* sqlite3VarintValue() is the legacy 9-byte-max codec, unusable
+      ** against a wide-flagged file's cells (see putVarint128()'s
+      ** comment, util.c) -- dispatch through the width-aware
+      ** abstraction instead. This is otherwise identical to the old
+      ** narrow-only fast path; the extra branch only costs anything on
+      ** the wide side, which is not the hot path. */
+      if( (pPage->pBt->btsFlags & BTS_WIDE_ROWID)!=0 ){
+        sqlite3GetVarintRowid(pCell, &nCellKey, 1);
+      }else{
+        nCellKey = rowidFromI64(sqlite3VarintValue(pCell));
+      }
+      if( rowidLt(nCellKey,intKey) ){
         lwr = idx+1;
         if( lwr>upr ){ c = -1; break; }
-      }else if( rowidGt(rowidFromI64(nCellKey),intKey) ){
+      }else if( rowidGt(nCellKey,intKey) ){
         upr = idx-1;
         if( lwr>upr ){ c = +1; break; }
       }else{
-        assert( rowidEqual(rowidFromI64(nCellKey),intKey) );
+        assert( rowidEqual(nCellKey,intKey) );
         pCur->ix = (u16)idx;
         if( !pPage->leaf ){
           lwr = idx;
           goto moveto_table_next_layer;
         }else{
           pCur->curFlags |= BTCF_ValidNKey;
-          pCur->info.nKey = rowidFromI64(nCellKey);
+          pCur->info.nKey = nCellKey;
           pCur->info.nSize = 0;
           *pRes = 0;
           return SQLITE_OK;
@@ -7176,7 +7241,8 @@ static int fillInCell(
     nSrc = pX->nData;
     assert( pPage->intKeyLeaf ); /* fillInCell() only called for leaves */
     nHeader += putVarint32(&pCell[nHeader], nPayload);
-    nHeader += sqlite3PutVarintRowid(&pCell[nHeader], pX->nKey);
+    nHeader += sqlite3PutVarintRowid(&pCell[nHeader], pX->nKey,
+                        (pPage->pBt->btsFlags & BTS_WIDE_ROWID)!=0);
   }else{
     assert( rowidLe(pX->nKey,rowidFromI64(0x7fffffff)) && pX->pKey!=0 );
     nSrc = nPayload = rowidToInt(pX->nKey);
@@ -8925,7 +8991,8 @@ static int balance_nonroot(
       j--;
       pNew->xParseCell(pNew, b.apCell[j], &info);
       pCell = pTemp;
-      sz = 4 + sqlite3PutVarintRowid(&pCell[4], info.nKey);
+      sz = 4 + sqlite3PutVarintRowid(&pCell[4], info.nKey,
+                        (pNew->pBt->btsFlags & BTS_WIDE_ROWID)!=0);
       pTemp = 0;
     }else{
       pCell -= 4;
@@ -9810,7 +9877,10 @@ int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, rowid_t iKey){
   }else{
     aOut += sqlite3PutVarint(aOut, pSrc->info.nPayload);
   }
-  if( pDest->pKeyInfo==0 ) aOut += sqlite3PutVarintRowid(aOut, iKey);
+  if( pDest->pKeyInfo==0 ){
+    aOut += sqlite3PutVarintRowid(aOut, iKey,
+                        (pBt->btsFlags & BTS_WIDE_ROWID)!=0);
+  }
   nIn = pSrc->info.nLocal;
   aIn = pSrc->info.pPayload;
   if( aIn+nIn>pSrc->pPage->aDataEnd ){

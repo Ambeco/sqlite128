@@ -504,6 +504,21 @@ struct BtShared {
                                        ** wider than 64 bits somewhere in it.
                                        ** Only ever set under
                                        ** SQLITE_128BIT_ROWID. */
+#define BTS_LEGACY_NARROW    0x0200   /* A SQLITE_128BIT_ROWID build opened
+                                       ** a *narrow* (zMagicHeader, legacy)
+                                       ** file: writes are forced off so a
+                                       ** wide-capable build never writes a
+                                       ** narrow-format rowid cell. Enforced
+                                       ** as its own condition at the write-
+                                       ** transaction gate in
+                                       ** sqlite3BtreeBeginTrans(), not
+                                       ** folded into BTS_READ_ONLY --
+                                       ** unrelated code (e.g. the
+                                       ** SQLITE_ResetDatabase handling in
+                                       ** that same function) legitimately
+                                       ** clears BTS_READ_ONLY for other
+                                       ** reasons and must not be able to
+                                       ** defeat this. */
 
 /*
 ** An instance of the following structure is used to hold information

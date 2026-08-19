@@ -1658,6 +1658,75 @@ u8 sqlite3GetVarint(const unsigned char *p, u64 *v){
   return (u8)(p - pStart) + 1;
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** Write the two's-complement bit pattern of a 128-bit value as a
+** variable-length varint of 1-19 bytes. Same shape as putVarint64()
+** above, just extended from a 9-byte cap to a 19-byte cap: 7 bits of
+** data per byte with the MSB as a continuation flag, except that once
+** all 18 continuation bytes are used the 19th (last) byte is raw,
+** unflagged 8 bits -- exactly the same "BBBB...C" pattern putVarint64
+** uses for 64-bit values, just with more B's (18*7+8=134 bits of
+** capacity, comfortably covering all 128).
+**
+** This is only ever used to encode a cell within a whole-database
+** wide-flagged file (see BTS_WIDE_ROWID) -- a narrow file never
+** contains a byte sequence this function produced, and this function
+** is never used to encode a cell in a narrow file. So there is no
+** ambiguity with, and no need to stay byte-compatible with, the
+** unmodified 9-byte-max sqlite3PutVarint()/sqlite3GetVarint() used for
+** narrow files -- the two codecs coexist only because they're always
+** applied to disjoint files, never mixed within one.
+*/
+static int putVarint128(unsigned char *p, sqlite3_uint128 v){
+  u8 buf[18];
+  int i, j, n;
+  if( !int128IsZero(int128ShiftRight(v, 126)) ){
+    /* Needs the full 19-byte form. */
+    p[18] = (u8)int128ToU64(v);
+    v = int128ShiftRight(v, 8);
+    for(i=17; i>=0; i--){
+      p[i] = (u8)((int128ToU64(v) & 0x7f) | 0x80);
+      v = int128ShiftRight(v, 7);
+    }
+    return 19;
+  }
+  n = 0;
+  do{
+    buf[n++] = (u8)((int128ToU64(v) & 0x7f) | 0x80);
+    v = int128ShiftRight(v, 7);
+  }while( !int128IsZero(v) );
+  buf[0] &= 0x7f;
+  assert( n<=18 );
+  for(i=0, j=n-1; j>=0; j--, i++){
+    p[i] = buf[j];
+  }
+  return n;
+}
+
+/*
+** Read a 128-bit variable-length integer written by putVarint128().
+** Return the number of bytes read (1-19). See putVarint128()'s comment
+** for the encoding shape.
+*/
+static u8 getVarint128(const unsigned char *p, sqlite3_uint128 *pv){
+  sqlite3_uint128 result = int128FromU64(0);
+  const u8 *pStart = p;
+  int i;
+  for(i=0; i<18; i++){
+    u8 b = *p++;
+    result = int128Add(int128ShiftLeft(result,7), int128FromU64(b & 0x7f));
+    if( (b & 0x80)==0 ){
+      *pv = result;
+      return (u8)(p - pStart);
+    }
+  }
+  result = int128Add(int128ShiftLeft(result,8), int128FromU64(*p++));
+  *pv = result;
+  return (u8)(p - pStart);
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 /*
 ** sqlite3PutVarintRowid() / sqlite3GetVarintRowid() are the disk-io
 ** abstraction boundary for table-btree rowids: every place that encodes
@@ -1665,30 +1734,39 @@ u8 sqlite3GetVarint(const unsigned char *p, u64 *v){
 ** these rather than calling sqlite3PutVarint()/sqlite3GetVarint()
 ** directly on the raw bits of a rowid_t.
 **
-** In a default build rowid_t is a signed 64-bit integer identical to i64,
-** and these are a thin wrapper around the existing 9-byte-max varint
-** codec (same on-disk bytes as always -- this is not a format change).
-**
-** In a SQLITE_128BIT_ROWID build, the encoding these use depends on
-** whether the specific b-tree being read/written has been marked "wide"
-** (see the BTREE_ROWID_FORMAT meta value and BtShared.rowidWide): narrow
-** b-trees still use this exact 9-byte codec (so legacy files remain
-** byte-for-byte readable), while wide b-trees use a different, longer
-** encoding capable of representing the full 128 bits. That wide codec,
-** and the logic that decides when to switch a database over to it, is
-** added in a later phase; for now sqlite3GetVarintRowid()/
-** sqlite3PutVarintRowid() only implement the narrow codec, so a
-** SQLITE_128BIT_ROWID build behaves like a normal build until the wide
-** path is wired in.
+** bWide selects the codec and must reflect the containing b-tree's
+** BTS_WIDE_ROWID state (never a per-cell choice -- see putVarint128()'s
+** comment for why the two codecs must never be mixed within one file).
+** In a default (non-SQLITE_128BIT_ROWID) build bWide is always 0, and
+** these are a thin wrapper around the existing 9-byte-max varint codec
+** (same on-disk bytes as always -- this is not a format change for
+** narrow files).
 */
-int sqlite3PutVarintRowid(unsigned char *p, rowid_t v){
-  return sqlite3PutVarint(p, (u64)rowidToI64(v));
+int sqlite3PutVarintRowid(unsigned char *p, rowid_t v, int bWide){
+  if( !bWide ){
+    return sqlite3PutVarint(p, (u64)rowidToI64(v));
+  }
+#ifdef SQLITE_128BIT_ROWID
+  return putVarint128(p, v);
+#else
+  assert( 0 ); /* unreachable: bWide can't be true without SQLITE_128BIT_ROWID */
+  return 0;
+#endif
 }
-u8 sqlite3GetVarintRowid(const unsigned char *p, rowid_t *v){
-  u64 v64;
-  u8 n = sqlite3GetVarint(p, &v64);
-  *v = rowidFromI64((i64)v64);
-  return n;
+u8 sqlite3GetVarintRowid(const unsigned char *p, rowid_t *v, int bWide){
+  if( !bWide ){
+    u64 v64;
+    u8 n = sqlite3GetVarint(p, &v64);
+    *v = rowidFromI64((i64)v64);
+    return n;
+  }
+#ifdef SQLITE_128BIT_ROWID
+  return getVarint128(p, v);
+#else
+  assert( 0 ); /* unreachable: bWide can't be true without SQLITE_128BIT_ROWID */
+  *v = rowidFromI64(0);
+  return 0;
+#endif
 }
 
 /*
