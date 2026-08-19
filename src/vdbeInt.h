@@ -335,14 +335,16 @@ struct sqlite3_value {
                                 ** default build's plain MEM_Int continues
                                 ** to cover every case there. This bit is
                                 ** NOT part of MEM_AffMask/MEM_TypeMask
-                                ** yet: as of this commit it is only
-                                ** constructible/readable via
+                                ** yet: it is constructible/readable via
                                 ** sqlite3VdbeMemSetInt128()/
-                                ** sqlite3VdbeMemInt128Value() (vdbemem.c)
-                                ** and is not yet recognized by
-                                ** sqlite3_value_type(), comparison,
-                                ** arithmetic, CAST, or the record
-                                ** serial-type encoding -- those are later,
+                                ** sqlite3VdbeMemInt128Value() (vdbemem.c),
+                                ** round-trips through the record/column
+                                ** serial-type-11 encoding (Phase 6b), and
+                                ** is recognized by sqlite3MemCompare()
+                                ** (Phase 6c). It is not yet recognized by
+                                ** sqlite3_value_type(), arithmetic, CAST,
+                                ** applyAffinity()/sqlite3VdbeMemNumerify(),
+                                ** or stringification -- those are later,
                                 ** separate sub-phases. */
 #define MEM_Cleared   0x0100   /* NULL set by OP_Null, not from data */
 #define MEM_Term      0x0200   /* String in Mem.z is zero terminated */
@@ -693,6 +695,9 @@ int sqlite3VdbeMemZeroTerminateIfAble(Mem*);
 int sqlite3VdbeMemMakeWriteable(Mem*);
 int sqlite3VdbeMemStringify(Mem*, u8, u8);
 int sqlite3IntFloatCompare(i64,double);
+#ifdef SQLITE_128BIT_ROWID
+int sqlite3Int128FloatCompare(sqlite3_uint128,double);
+#endif
 i64 sqlite3VdbeIntValue(const Mem*);
 int sqlite3VdbeMemIntegerify(Mem*);
 double sqlite3VdbeRealValue(Mem*);

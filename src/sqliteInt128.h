@@ -76,6 +76,20 @@ static SQLITE_INLINE sqlite3_uint128 int128Multiply(u64 a, u64 b){
   return (sqlite3_uint128)a * (sqlite3_uint128)b;
 }
 
+/* Sign-extend a 64-bit signed integer into a two's-complement
+** sqlite3_uint128. Converting a negative i64 to a wider unsigned type
+** is well-defined by C as reduction modulo 2^128, which for a two's-
+** complement representation is exactly sign extension. */
+#define int128FromI64(x)        ((sqlite3_uint128)(i64)(x))
+
+/* Unsigned-magnitude conversions to/from double, used to build the
+** signed versions below. r must be in [0, 2^128) for the FromDouble
+** direction. */
+#define int128ToDoubleUnsigned(x)      ((double)(x))
+static SQLITE_INLINE sqlite3_uint128 int128FromDoubleUnsigned(double r){
+  return (sqlite3_uint128)r;
+}
+
 #else /* !SQLITE_USE_UINT128 */
 
 typedef union sqlite3_uint128 sqlite3_uint128;
@@ -175,6 +189,44 @@ static SQLITE_INLINE sqlite3_uint128 int128Multiply(u64 a, u64 b){
   return r;
 }
 
+/* Sign-extend a 64-bit signed integer into a two's-complement
+** sqlite3_uint128. */
+static SQLITE_INLINE sqlite3_uint128 int128FromI64(i64 x){
+  sqlite3_uint128 r;
+  r.quads[0] = (u64)x;
+  r.quads[1] = (x<0) ? ((u64)-1) : 0;
+  return r;
+}
+
+/* Unsigned-magnitude conversions to/from double, used to build the
+** signed versions below. r must be in [0, 2^64*2^64) for the
+** FromDouble direction; 2^64 (18446744073709551616.0) is exactly
+** representable as a double. */
+static SQLITE_INLINE double int128ToDoubleUnsigned(sqlite3_uint128 x){
+  return ((double)x.quads[1])*18446744073709551616.0 + (double)x.quads[0];
+}
+static SQLITE_INLINE sqlite3_uint128 int128FromDoubleUnsigned(double r){
+  sqlite3_uint128 res;
+  double hi = r/18446744073709551616.0;
+  res.quads[1] = (u64)hi;
+  res.quads[0] = (u64)(r - ((double)res.quads[1])*18446744073709551616.0);
+  return res;
+}
+
 #endif /* SQLITE_USE_UINT128 */
+
+/* The following two helpers are common to both representations above,
+** built entirely from the per-representation primitives already
+** defined. They convert between a signed (two's-complement)
+** sqlite3_uint128 and the nearest double, mirroring how i64<->double
+** conversion works for sqlite3IntFloatCompare() (vdbeaux.c). */
+static SQLITE_INLINE double int128ToDoubleSigned(sqlite3_uint128 x){
+  if( int128IsNegative(x) ) return -int128ToDoubleUnsigned(int128Negate(x));
+  return int128ToDoubleUnsigned(x);
+}
+static SQLITE_INLINE sqlite3_uint128 int128FromDoubleSigned(double r){
+  if( r<0.0 ) return int128Negate(int128FromDoubleUnsigned(-r));
+  return int128FromDoubleUnsigned(r);
+}
 
 #endif /* SQLITE_INT128_H */

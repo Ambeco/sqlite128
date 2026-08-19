@@ -4575,6 +4575,40 @@ int sqlite3IntFloatCompare(i64 i, double r){
   }
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** Do a comparison between a signed (two's-complement) 128-bit integer and
+** a 64-bit floating-point number.  Return negative, zero, or positive if
+** the first (i128) is less than, equal to, or greater than the second
+** (double). This is the Phase 6c (comparison) analog of
+** sqlite3IntFloatCompare() above, sized for sqlite3_uint128 -- see that
+** function's comment for the general strategy (exact integer comparison
+** first, then a double tie-break for any fractional part of r).
+*/
+int sqlite3Int128FloatCompare(sqlite3_uint128 i, double r){
+  if( sqlite3IsNaN(r) ){
+    /* SQLite considers NaN to be a NULL. And all integer values are greater
+    ** than NULL */
+    return 1;
+  }else{
+    sqlite3_uint128 y;
+    int c;
+    double di;
+    /* 2^127, exactly representable as a double */
+    if( r<-170141183460469231731687303715884105728.0 ) return +1;
+    if( r>=170141183460469231731687303715884105728.0 ) return -1;
+    y = int128FromDoubleSigned(r);
+    c = int128CompareSigned(i, y);
+    if( c!=0 ) return c;
+    di = int128ToDoubleSigned(i);
+    testcase( doubleLt(di,r) );
+    testcase( doubleLt(r,di) );
+    testcase( doubleEq(r,di) );
+    return (di<r) ? -1 : (di>r);
+  }
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 /*
 ** Compare the values contained by the two memory cells, returning
 ** negative, zero or positive if pMem1 is less than, equal to, or greater
@@ -4599,6 +4633,38 @@ int sqlite3MemCompare(const Mem *pMem1, const Mem *pMem2, const CollSeq *pColl){
   if( combined_flags&MEM_Null ){
     return (f2&MEM_Null) - (f1&MEM_Null);
   }
+
+#ifdef SQLITE_128BIT_ROWID
+  /* At least one of the two values is a 128-bit integer (Phase 6c). Handle
+  ** this before the plain-numeric branch below: Mem.u.i128 and Mem.u.i/
+  ** Mem.u.r alias the same union member, so a Mem carrying MEM_Int128 must
+  ** never be read as if MEM_Int or MEM_Real were set, or vice versa. A
+  ** narrow (non-SQLITE_128BIT_ROWID) build can never produce a Mem with
+  ** MEM_Int128 set, so this whole branch is compiled out there. */
+  if( combined_flags&MEM_Int128 ){
+    if( (f1 & f2 & MEM_Int128)!=0 ){
+      return int128CompareSigned(pMem1->u.i128, pMem2->u.i128);
+    }
+    if( (f1 & MEM_Int128)!=0 ){
+      if( (f2 & (MEM_Int|MEM_IntReal))!=0 ){
+        return int128CompareSigned(pMem1->u.i128, int128FromI64(pMem2->u.i));
+      }else if( (f2 & MEM_Real)!=0 ){
+        return sqlite3Int128FloatCompare(pMem1->u.i128, pMem2->u.r);
+      }else{
+        return -1;
+      }
+    }else{
+      /* f2 has MEM_Int128 set, f1 does not */
+      if( (f1 & (MEM_Int|MEM_IntReal))!=0 ){
+        return -int128CompareSigned(pMem2->u.i128, int128FromI64(pMem1->u.i));
+      }else if( (f1 & MEM_Real)!=0 ){
+        return -sqlite3Int128FloatCompare(pMem2->u.i128, pMem1->u.r);
+      }else{
+        return +1;
+      }
+    }
+  }
+#endif /* SQLITE_128BIT_ROWID */
 
   /* At least one of the two values is a number
   */
