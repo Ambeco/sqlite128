@@ -43,7 +43,7 @@ right fixed width and type at runtime:
 |---|---|
 | `BLOB(W)`, W≤16 | `NOT NULL`, `CHECK(length(col)=W)` |
 | `TEXT(W)`, W≤16 | `NOT NULL`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
-| `REAL`/`FLOAT`/`DOUBLE`* | `NOT NULL`, `CHECK(typeof(col)='real')` |
+| `REAL` | `NOT NULL`, `CHECK(typeof(col)='real')` |
 
 This mirrors, deliberately, how `INTEGER PRIMARY KEY` itself already works in mainline SQLite: it's
 spelling-sensitive (`INT PRIMARY KEY` does *not* get rowid-aliasing, only literally `INTEGER`
