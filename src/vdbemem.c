@@ -647,6 +647,15 @@ i64 sqlite3VdbeIntValue(const Mem *pMem){
   if( flags & (MEM_Int|MEM_IntReal) ){
     testcase( flags & MEM_IntReal );
     return pMem->u.i;
+#ifdef SQLITE_128BIT_ROWID
+  }else if( flags & MEM_Int128 ){
+    /* Truncate to the low 64 bits (Phase 6f), same "forced, possibly
+    ** lossy" convention CAST(x AS INTEGER) already documents for a
+    ** MEM_Real input -- see sqlite3VdbeMemCast()/sqlite3VdbeMemIntegerify()
+    ** above this function. */
+    testcase( flags & MEM_Int128 );
+    return (i64)int128ToU64(pMem->u.i128);
+#endif
   }else if( flags & MEM_Real ){
     return sqlite3RealToI64(pMem->u.r);
   }else if( (flags & (MEM_Str|MEM_Blob))!=0 && pMem->z!=0 ){
@@ -773,6 +782,14 @@ double sqlite3VdbeRealValue(Mem *pMem){
   assert( EIGHT_BYTE_ALIGNMENT(pMem) );
   if( pMem->flags & MEM_Real ){
     return pMem->u.r;
+#ifdef SQLITE_128BIT_ROWID
+  }else if( pMem->flags & MEM_Int128 ){
+    /* Approximate as a double (Phase 6f), possibly lossy for magnitudes
+    ** beyond a double's 53-bit mantissa -- the same trade-off already
+    ** made for a plain 64-bit MEM_Int just below. */
+    testcase( pMem->flags & MEM_Int128 );
+    return int128ToDoubleSigned(pMem->u.i128);
+#endif
   }else if( pMem->flags & (MEM_Int|MEM_IntReal) ){
     testcase( pMem->flags & MEM_IntReal );
     return (double)pMem->u.i;
@@ -896,6 +913,16 @@ int sqlite3VdbeMemNumerify(Mem *pMem){
   testcase( pMem->flags & MEM_Real );
   testcase( pMem->flags & MEM_IntReal );
   testcase( pMem->flags & MEM_Null );
+#ifdef SQLITE_128BIT_ROWID
+  testcase( pMem->flags & MEM_Int128 );
+  if( pMem->flags & MEM_Int128 ){
+    /* Already numeric (Phase 6f) -- MEM_Int128 aliases Mem.u.i128, not
+    ** Mem.z/Mem.n, so it must never fall into the Blob/Str-reparse branch
+    ** below, which would otherwise misread those fields as if this were
+    ** an unconverted string/blob value. */
+    return SQLITE_OK;
+  }
+#endif
   if( (pMem->flags & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Null))==0 ){
     int rc;
     sqlite3_int64 ix;

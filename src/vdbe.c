@@ -402,6 +402,11 @@ static void applyAffinity(
   if( affinity>=SQLITE_AFF_NUMERIC ){
     assert( affinity==SQLITE_AFF_INTEGER || affinity==SQLITE_AFF_REAL
              || affinity==SQLITE_AFF_NUMERIC || affinity==SQLITE_AFF_FLEXNUM );
+    /* Phase 6f: a MEM_Int128 pRec has none of MEM_Int/MEM_Real/MEM_IntReal/
+    ** MEM_Str set, so both branches below are already correctly skipped
+    ** for it -- it's already numeric (more precisely so than any affinity
+    ** here could ask for), and there is no string representation to
+    ** reparse. No code change needed, just noting it's not an oversight. */
     if( (pRec->flags & MEM_Int)==0 ){ /*OPTIMIZATION-IF-FALSE*/
       if( (pRec->flags & (MEM_Real|MEM_IntReal))==0 ){
         if( pRec->flags & MEM_Str ) applyNumericAffinity(pRec,1);
@@ -422,6 +427,13 @@ static void applyAffinity(
         testcase( pRec->flags & MEM_IntReal );
         sqlite3VdbeMemStringify(pRec, enc, 1);
       }
+      /* A MEM_Int128 pRec is not covered by the condition above (its
+      ** MEM_Int128 bit isn't in that mask), so TEXT affinity is still a
+      ** silent no-op for it -- correct in the sense that it neither
+      ** crashes nor corrupts pRec, but a MEM_Int128 value doesn't yet get
+      ** an actual string representation here. That needs
+      ** sqlite3VdbeMemStringify() to understand MEM_Int128 first
+      ** (Phase 6g), which it does not yet. */
     }
     pRec->flags &= ~(MEM_Real|MEM_Int|MEM_IntReal);
   }
