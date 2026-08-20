@@ -379,6 +379,24 @@ struct sqlite3_api_routines {
   /* Version 3.54.0 and later */
   sqlite3_int64 (*incomplete)(const char*);
   void (*result_str)(sqlite3_context*,sqlite3_str*,int);
+#ifdef SQLITE_128BIT_ROWID
+  /* SQLITE_128BIT_ROWID build only (Phase 6i/7). Unlike other optional
+  ** groups above (e.g. carray_bind, which stay at a fixed struct offset
+  ** and fall back to a 0 placeholder in loadext.c when disabled, so that
+  ** an extension keeps working against a core built either way),
+  ** SQLITE_128BIT_ROWID changes the on-disk file format and the size of
+  ** Mem/VdbeOp themselves -- a loadable extension already cannot usefully
+  ** operate against a core built with a different SQLITE_128BIT_ROWID
+  ** setting than it was, regardless of this struct's layout. So these
+  ** four entries are only present at all (shifting every later entry's
+  ** offset, if any were ever added after them) when this header and the
+  ** core agree on SQLITE_128BIT_ROWID -- which an extension for this
+  ** fork must always arrange anyway. */
+  int (*bind_int128)(sqlite3_stmt*,int,sqlite3_int64,sqlite3_uint64);
+  void (*column_int128)(sqlite3_stmt*,int,sqlite3_int64*,sqlite3_uint64*);
+  void (*value_int128)(sqlite3_value*,sqlite3_int64*,sqlite3_uint64*);
+  void (*result_int128)(sqlite3_context*,sqlite3_int64,sqlite3_uint64);
+#endif
 };
 
 /*
@@ -725,6 +743,12 @@ typedef int (*sqlite3_loadext_entry)(
 /* Version 3.54.0 and later */
 #define sqlite3_incomplete             sqlite3_api->incomplete
 #define sqlite3_result_str             sqlite3_api->result_str
+#ifdef SQLITE_128BIT_ROWID
+#define sqlite3_bind_int128            sqlite3_api->bind_int128
+#define sqlite3_column_int128          sqlite3_api->column_int128
+#define sqlite3_value_int128           sqlite3_api->value_int128
+#define sqlite3_result_int128          sqlite3_api->result_int128
+#endif
 #endif /* !defined(SQLITE_CORE) && !defined(SQLITE_OMIT_LOAD_EXTENSION) */
 
 #if !defined(SQLITE_CORE) && !defined(SQLITE_OMIT_LOAD_EXTENSION)

@@ -6681,6 +6681,21 @@ void sqlite3_result_error_nomem(sqlite3_context*);
 void sqlite3_result_error_code(sqlite3_context*, int);
 void sqlite3_result_int(sqlite3_context*, int);
 void sqlite3_result_int64(sqlite3_context*, sqlite3_int64);
+#ifdef SQLITE_128BIT_ROWID
+/*
+** CAPI3REF: Setting The Result Of An SQL Function To A 128-Bit Integer
+** METHOD: sqlite3_context
+**
+** Set the result of an application-defined SQL function to a signed
+** 128-bit (two's-complement) integer, in a SQLITE_128BIT_ROWID build
+** (Phase 7) -- the [sqlite3_result_int64()] analog for 128-bit values.
+** See [sqlite3_bind_int128()] for the hi/lo convention. This is what
+** lets a function such as uuid_int() (ext/misc/uuid.c) return a genuine
+** SQLITE_INTEGER-typed 128-bit value instead of a 16-byte BLOB.
+*/
+void sqlite3_result_int128(sqlite3_context*, sqlite3_int64 hiValue,
+                            sqlite3_uint64 loValue);
+#endif
 void sqlite3_result_null(sqlite3_context*);
 void sqlite3_result_text(sqlite3_context*, const char*, int, void(*)(void*));
 void sqlite3_result_text64(sqlite3_context*, const char *z, sqlite3_uint64 n,

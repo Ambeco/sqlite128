@@ -562,6 +562,27 @@ void sqlite3_result_int64(sqlite3_context *pCtx, i64 iVal){
   assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
   sqlite3VdbeMemSetInt64(pCtx->pOut, iVal);
 }
+#ifdef SQLITE_128BIT_ROWID
+/*
+** Phase 7: set the result of an SQL function to a genuine 128-bit
+** integer, using the same (hi,lo) two-limb convention as
+** sqlite3_bind_int128()/sqlite3_column_int128()/sqlite3_value_int128()
+** (Phase 6i). This is what lets a function like uuid_int() (see
+** ext/misc/uuid.c) return an actual SQLITE_INTEGER-typed 128-bit value
+** instead of a 16-byte BLOB.
+*/
+void sqlite3_result_int128(sqlite3_context *pCtx, sqlite3_int64 hiValue,
+                            sqlite3_uint64 loValue){
+  sqlite3_uint128 v;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pCtx==0 ) return;
+#endif
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  v = int128Add(int128ShiftLeft(int128FromU64((u64)hiValue), 64),
+                 int128FromU64(loValue));
+  sqlite3VdbeMemSetInt128(pCtx->pOut, v);
+}
+#endif
 void sqlite3_result_null(sqlite3_context *pCtx){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( pCtx==0 ) return;
