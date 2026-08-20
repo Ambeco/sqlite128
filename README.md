@@ -93,50 +93,60 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
 
 This fork has been built as a sequence of small, individually-verified phases. Note that this
 project's direction shifted partway through (see §2): early phases explored storing a UUID as an
-actual 128-bit SQL `INTEGER` value; the design converged instead on storing a UUID primary key
-directly in its native `BLOB`/`TEXT` form as the table's rowid. The 128-bit-integer *engine*
-infrastructure those early phases built (Phases 1, 6) remains essential — it's what the narrow-PK
-feature's rowid is made of internally — but the SQL-user-visible "UUID as an INTEGER" framing
-(`uuid_int()`, Phase 5) has been superseded and removed; see the note at the end of Phase 7a.
+actual 128-bit SQL `INTEGER` value (Phases 5–7a below); the design converged instead on storing a
+UUID primary key directly in its native `BLOB`/`TEXT` form as the table's rowid, which needs only
+the lower-level `rowid_t`/`sqlite3_uint128` arithmetic (Phases 1–4), not a SQL-visible 128-bit
+`INTEGER` type at all. Once that became clear, **Phase 6 and Phase 7a's SQL-integer-facing work
+were reverted outright** (not just left unused) to keep this fork as close to mainline SQLite as
+reasonable — see the note after Phase 7a below. `INTEGER` is, today, exactly the same 64-bit type
+it is in mainline SQLite.
 
-### Phase 1–4: wide-rowid foundation (**done**)
+### Phase 1–4: wide-rowid foundation (**done — this is the foundation still in use**)
 `rowid_t` typedef and core rowid abstraction; disk-I/O rowid handling and file-format width
 detection; `sqlite3_uint128` arithmetic primitives (`sqliteInt128.h`); `SQLITE_128BIT_ROWID`
 compiles; page-1 magic-header gate for wide-rowid files; whole-database wide-rowid codec with
-convert-only-via-SQL migration.
+convert-only-via-SQL migration. This is the only prior-phase code the narrow-PK-as-rowid feature
+(§1/§2) actually depends on.
 
-### Phase 5: UUID extension groundwork (**done, later superseded — see Phase 7a note**)
-`uuid_int(x)` added to `ext/misc/uuid.c` (this function has since been removed; see below).
+### Phase 5: UUID extension groundwork (**done, later reverted**)
+`uuid_int(x)` added to `ext/misc/uuid.c`. Removed later (see Phase 7a note) once it no longer
+served a purpose.
 
-### Phase 6: widen `Mem`/SQL-value handling to 128 bits (**done**, 6a–6i)
+### Phase 6: widen `Mem`/SQL-value handling to 128 bits (**done, later reverted — see below**)
 Construction/access (6a) → record/column on-disk storage, serial type 11 (6b) → comparison (6c) →
 128-bit multiply/divide/modulo primitives (6e) → arithmetic opcodes (6d) → affinity/numerify/cast
 awareness (6f) → decimal-render/stringify support (6g) → decimal & hex SQL literal parsing plus a
 new `OP_Int128` opcode (6h) → `sqlite3_value_type()` fix and a full `sqlite3_bind_int128`/
-`sqlite3_column_int128`/`sqlite3_value_int128` C API (6i). A 128-bit `INTEGER` value is now fully
-usable everywhere in the engine: arithmetic, comparison, casting, storage, and C API access. This
-general-purpose capability stands on its own regardless of the narrow-PK-as-rowid feature — it's
-the internal machinery a `BLOB`/`TEXT`/`REAL` rowid is built from, and remains available for
-ordinary 128-bit integer arithmetic too.
+`sqlite3_column_int128`/`sqlite3_value_int128` C API (6i). This made a 128-bit `INTEGER` value fully
+usable everywhere in the engine — arithmetic, comparison, casting, storage, C API access — built
+under the original premise that a UUID would be stored *as* a SQL `INTEGER`.
+**Reverted:** once the design moved to storing a UUID primary key directly in its native `BLOB`/
+`TEXT` form (§2) instead, nothing in the engine actually needed a value to *be* a 128-bit SQL
+integer — the narrow-PK design's rowid encoding is an internal b-tree-key representation only,
+never surfaced to SQL as an `INTEGER`. With no remaining concrete use case for a SQL-visible
+128-bit integer, all of Phase 6a–6i was reverted (`MEM_Int128`, `OP_Int128`, the arithmetic/
+comparison/casting/stringify/literal-parsing work — thirteen files restored to their exact
+pre-Phase-6 state), to minimize this fork's divergence from mainline. `sqliteInt128.h`'s Phase 1–3
+primitives were untouched by the revert; only the additions Phase 6 layered on top were removed.
 
-### Phase 7: making int128 practically usable (**in progress**)
-- **7a (done):** added `sqlite3_result_int128()` C API, wired into the loadable-extension API
-  surface (`sqlite3ext.h`/`loadext.c`) so extensions — not just directly-linked C code — can
-  produce 128-bit results; `ext/misc/uuid.c`'s `uuid_int()` was updated to use it, returning a
-  genuine `INTEGER`-typed 128-bit value instead of a 16-byte `BLOB`. **Superseded shortly after and
-  removed:** once the design moved to storing a UUID primary key directly in its native `BLOB`/
-  `TEXT` form (§2), `uuid_int()` no longer served a purpose, so it was deleted outright to keep
-  `ext/misc/uuid.c` as close to mainline SQLite's version as reasonable. The `sqlite3_result_int128()`
-  C API itself was kept — it's general-purpose infrastructure (Phase 6/6i's counterpart for
-  function results), not uuid.c-specific.
+### Phase 7: making int128 practically usable (**abandoned — see revert note**)
+- **7a (done, later reverted):** added `sqlite3_result_int128()` C API, wired into the
+  loadable-extension API surface (`sqlite3ext.h`/`loadext.c`) so extensions — not just
+  directly-linked C code — could produce 128-bit results; `ext/misc/uuid.c`'s `uuid_int()` was
+  updated to use it, returning a genuine `INTEGER`-typed 128-bit value instead of a 16-byte `BLOB`.
+  **Superseded and removed, in two steps:** first `uuid_int()` itself was deleted (it no longer
+  served a purpose once UUID primary keys stopped being stored as integers at all), then, once it
+  became clear nothing else needed a SQL-visible 128-bit integer either, `sqlite3_result_int128()`
+  and the rest of Phase 6/6i's C API were reverted too, alongside all of Phase 6.
 - **Narrow-fixed-width-PK-as-rowid (planned, design complete, implementation not started):** the
-  §1/§2 feature above. Full design is settled; remaining pre-implementation work is a concrete
-  near-miss test-case table, exact error-message wording, and a from-scratch audit of every place
-  in the codebase that currently assumes a rowid-aliased column is an `INTEGER` (there are many:
-  `insert.c`, `update.c`, the query planner's seek paths, `fkey.c`, and more). Planned phases (A–H):
-  schema-level detection/validation → value↔rowid conversion primitives → INSERT codegen → SELECT
-  read-back codegen → WHERE-clause/seek integration → UPDATE codegen → foreign-key verification →
-  remaining edge cases (`AUTOINCREMENT` rejection, `WITHOUT ROWID` exclusion, introspection).
+  §1/§2 feature above, and the actual current direction of this project. Full design is settled;
+  remaining pre-implementation work is a concrete near-miss test-case table, exact error-message
+  wording, and a from-scratch audit of every place in the codebase that currently assumes a
+  rowid-aliased column is an `INTEGER` (there are many: `insert.c`, `update.c`, the query planner's
+  seek paths, `fkey.c`, and more). Planned phases (A–H): schema-level detection/validation →
+  value↔rowid conversion primitives → INSERT codegen → SELECT read-back codegen → WHERE-clause/seek
+  integration → UPDATE codegen → foreign-key verification → remaining edge cases (`AUTOINCREMENT`
+  rejection, `WITHOUT ROWID` exclusion, introspection).
 
 ## 4. Potential follow-up work
 
