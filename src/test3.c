@@ -624,12 +624,12 @@ static int SQLITE_TCLAPI btree_insert(
   memset(&x, 0, sizeof(x));
   if( objc==4 ){
     if( Tcl_GetIntFromObj(interp, objv[2], &rc) ) return TCL_ERROR;
-    x.nKey = rc;
+    x.nKey = rowidFromI64(rc);
     x.pData = (void*)Tcl_GetByteArrayFromObj(objv[3], &n);
     x.nData = (int)n;
   }else{
     x.pKey = (void*)Tcl_GetByteArrayFromObj(objv[2], &n);
-    x.nKey = (int)n;
+    x.nKey = rowidFromI64((i64)n);
   }
   pCur = (BtCursor*)sqlite3TestTextToPtr(Tcl_GetString(objv[1]));
 
