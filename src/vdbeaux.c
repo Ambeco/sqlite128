@@ -483,6 +483,27 @@ int sqlite3VdbeAddOp4Dup8(
   return sqlite3VdbeAddOp4(p, op, p1, p2, p3, p4copy, p4type);
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** Add an opcode that includes the p4 value with a P4_INT128 type
+** (Phase 6h). 16-byte analog of sqlite3VdbeAddOp4Dup8() just above, for
+** OP_Int128.
+*/
+int sqlite3VdbeAddOp4Dup16(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  const u8 *zP4,      /* The P4 operand */
+  int p4type          /* P4 operand type */
+){
+  char *p4copy = sqlite3DbMallocRawNN(sqlite3VdbeDb(p), 16);
+  if( p4copy ) memcpy(p4copy, zP4, 16);
+  return sqlite3VdbeAddOp4(p, op, p1, p2, p3, p4copy, p4type);
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 #ifndef SQLITE_OMIT_EXPLAIN
 /*
 ** Return the address of the current EXPLAIN QUERY PLAN baseline.
@@ -1391,6 +1412,7 @@ static void freeP4(sqlite3 *db, int p4type, void *p4){
     }
     case P4_REAL:
     case P4_INT64:
+    case P4_INT128:
     case P4_DYNAMIC:
     case P4_INTARRAY: {
       if( p4 ) sqlite3DbNNFreeNN(db, p4);
@@ -1960,6 +1982,14 @@ char *sqlite3VdbeDisplayP4(sqlite3 *db, Op *pOp){
       sqlite3_str_appendf(&x, "%lld", *pOp->p4.pI64);
       break;
     }
+#ifdef SQLITE_128BIT_ROWID
+    case P4_INT128: {
+      char zBuf[SQLITE_INT128_DIGITS+2];
+      int128ToText(*pOp->p4.pI128, zBuf);
+      sqlite3_str_appendf(&x, "%s", zBuf);
+      break;
+    }
+#endif
     case P4_INT32: {
       sqlite3_str_appendf(&x, "%d", pOp->p4.i);
       break;

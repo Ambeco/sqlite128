@@ -5603,6 +5603,9 @@ char sqlite3ExprAffinity(const Expr *pExpr);
 int sqlite3ExprDataType(const Expr *pExpr);
 int sqlite3Atoi64(const char*, i64*, int, u8);
 int sqlite3DecOrHexToI64(const char*, i64*);
+#ifdef SQLITE_128BIT_ROWID
+int sqlite3DecOrHexToI128(const char*, sqlite3_uint128*);
+#endif
 void sqlite3ErrorWithMsg(sqlite3*, int, const char*,...);
 void sqlite3Error(sqlite3*,int);
 void sqlite3ErrorClear(sqlite3*);

@@ -1449,6 +1449,21 @@ case OP_Int64: {           /* out2 */
   break;
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/* Opcode: Int128 * P2 * P4 *
+** Synopsis: r[P2]=P4
+**
+** P4 is a pointer to a 128-bit integer value (SQLITE_128BIT_ROWID builds
+** only -- see Phase 6h). Write that value into register P2.
+*/
+case OP_Int128: {          /* out2 */
+  pOut = out2Prerelease(p, pOp);
+  assert( pOp->p4.pI128!=0 );
+  sqlite3VdbeMemSetInt128(pOut, *pOp->p4.pI128);
+  break;
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 #ifndef SQLITE_OMIT_FLOATING_POINT
 /* Opcode: Real * P2 * P4 *
 ** Synopsis: r[P2]=P4
