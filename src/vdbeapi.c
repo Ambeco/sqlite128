@@ -213,28 +213,6 @@ int sqlite3_value_int(sqlite3_value *pVal){
 sqlite_int64 sqlite3_value_int64(sqlite3_value *pVal){
   return sqlite3VdbeIntValue((Mem*)pVal);
 }
-#ifdef SQLITE_128BIT_ROWID
-/*
-** Phase 6i: the sqlite3_value* analog of sqlite3_column_int128() below.
-** A pVal that doesn't actually hold a MEM_Int128 is widened the same
-** way sqlite3_value_int64() already narrows it -- via sqlite3VdbeIntValue(),
-** then sign-extended to 128 bits -- so this is always safe to call
-** regardless of pVal's actual type, same guarantee sqlite3_value_int64()
-** already makes.
-*/
-void sqlite3_value_int128(sqlite3_value *pVal, sqlite3_int64 *pHi,
-                           sqlite3_uint64 *pLo){
-  Mem *p = (Mem*)pVal;
-  sqlite3_uint128 v;
-  if( p->flags & MEM_Int128 ){
-    v = p->u.i128;
-  }else{
-    v = int128FromI64(sqlite3VdbeIntValue(p));
-  }
-  *pLo = (sqlite3_uint64)int128ToU64(v);
-  *pHi = (sqlite3_int64)int128ToU64(int128ShiftRight(v, 64));
-}
-#endif
 unsigned int sqlite3_value_subtype(sqlite3_value *pVal){
   Mem *pMem = (Mem*)pVal;
   return ((pMem->flags & MEM_Subtype) ? pMem->eSubtype : 0);
@@ -337,14 +315,6 @@ int sqlite3_value_type(sqlite3_value* pVal){
      SQLITE_FLOAT,    /* 0x3e (not possible) */
      SQLITE_NULL,     /* 0x3f (not possible) */
   };
-#ifdef SQLITE_128BIT_ROWID
-  /* Phase 6i: MEM_Int128 (0x0080) is outside MEM_AffMask (0x003f), so
-  ** aType[pVal->flags&MEM_AffMask] below would index using flags with
-  ** that bit masked away -- for a Mem holding *only* MEM_Int128 (flags
-  ** exactly 0x0080), that's index 0, silently reporting SQLITE_BLOB
-  ** instead of SQLITE_INTEGER. Handle it explicitly first. */
-  if( pVal->flags & MEM_Int128 ) return SQLITE_INTEGER;
-#endif
 #ifdef SQLITE_DEBUG
   {
     int eType = SQLITE_BLOB;
@@ -562,27 +532,6 @@ void sqlite3_result_int64(sqlite3_context *pCtx, i64 iVal){
   assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
   sqlite3VdbeMemSetInt64(pCtx->pOut, iVal);
 }
-#ifdef SQLITE_128BIT_ROWID
-/*
-** Phase 7: set the result of an SQL function to a genuine 128-bit
-** integer, using the same (hi,lo) two-limb convention as
-** sqlite3_bind_int128()/sqlite3_column_int128()/sqlite3_value_int128()
-** (Phase 6i). This is what lets a function like uuid_int() (see
-** ext/misc/uuid.c) return an actual SQLITE_INTEGER-typed 128-bit value
-** instead of a 16-byte BLOB.
-*/
-void sqlite3_result_int128(sqlite3_context *pCtx, sqlite3_int64 hiValue,
-                            sqlite3_uint64 loValue){
-  sqlite3_uint128 v;
-#ifdef SQLITE_ENABLE_API_ARMOR
-  if( pCtx==0 ) return;
-#endif
-  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
-  v = int128Add(int128ShiftLeft(int128FromU64((u64)hiValue), 64),
-                 int128FromU64(loValue));
-  sqlite3VdbeMemSetInt128(pCtx->pOut, v);
-}
-#endif
 void sqlite3_result_null(sqlite3_context *pCtx){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( pCtx==0 ) return;
@@ -1531,17 +1480,6 @@ sqlite_int64 sqlite3_column_int64(sqlite3_stmt *pStmt, int i){
   columnMallocFailure(pStmt);
   return val;
 }
-#ifdef SQLITE_128BIT_ROWID
-void sqlite3_column_int128(
-  sqlite3_stmt *pStmt,
-  int i,
-  sqlite3_int64 *pHi,
-  sqlite3_uint64 *pLo
-){
-  sqlite3_value_int128( columnMem(pStmt,i), pHi, pLo );
-  columnMallocFailure(pStmt);
-}
-#endif
 const unsigned char *sqlite3_column_text(sqlite3_stmt *pStmt, int i){
   const unsigned char *val = sqlite3_value_text( columnMem(pStmt,i) );
   columnMallocFailure(pStmt);
@@ -1922,27 +1860,6 @@ int sqlite3_bind_int64(sqlite3_stmt *pStmt, int i, sqlite_int64 iValue){
   }
   return rc;
 }
-#ifdef SQLITE_128BIT_ROWID
-int sqlite3_bind_int128(
-  sqlite3_stmt *pStmt,
-  int i,
-  sqlite3_int64 hiValue,
-  sqlite3_uint64 loValue
-){
-  int rc;
-  Vdbe *p = (Vdbe *)pStmt;
-  rc = vdbeUnbind(p, (u32)(i-1));
-  if( rc==SQLITE_OK ){
-    sqlite3_uint128 v;
-    assert( p!=0 && p->aVar!=0 && i>0 && i<=p->nVar ); /* tag-20240917-01 */
-    v = int128Add(int128ShiftLeft(int128FromU64((u64)hiValue), 64),
-                   int128FromU64(loValue));
-    sqlite3VdbeMemSetInt128(&p->aVar[i-1], v);
-    sqlite3_mutex_leave(p->db->mutex);
-  }
-  return rc;
-}
-#endif
 int sqlite3_bind_null(sqlite3_stmt *pStmt, int i){
   int rc;
   Vdbe *p = (Vdbe*)pStmt;

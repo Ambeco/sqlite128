@@ -4379,37 +4379,19 @@ static void codeInteger(Parse *pParse, Expr *pExpr, int negFlag, int iMem){
     assert( z!=0 );
     c = sqlite3DecOrHexToI64(z, &value);
     if( (c==3 && !negFlag) || (c==2) || (negFlag && value==SMALLEST_INT64)){
-#ifdef SQLITE_128BIT_ROWID
-      /* Phase 6h: before giving up to floating point (or erroring out),
-      ** see if the literal fits in 128 bits. An integer literal that
-      ** overflows i64 is not necessarily a mistake in a wide-rowid build
-      ** -- it might be, e.g., a UUID-derived value (see uuid_int(),
-      ** ext/misc/uuid.c) -- so prefer the more precise integer
-      ** representation here the same way the plain-i64 case below already
-      ** prefers integer over floating point whenever it can. */
-      sqlite3_uint128 wvalue;
-      int c128 = sqlite3DecOrHexToI128(z, &wvalue);
-      if( c128==0 || (c128==3 && negFlag) ){
-        if( negFlag ) wvalue = int128Negate(wvalue);
-        sqlite3VdbeAddOp4Dup16(v, OP_Int128, 0, iMem, 0,
-                                (const u8*)&wvalue, P4_INT128);
+#ifdef SQLITE_OMIT_FLOATING_POINT
+      sqlite3ErrorMsg(pParse, "oversized integer: %s%#T", negFlag?"-":"",pExpr);
+#else
+#ifndef SQLITE_OMIT_HEX_INTEGER
+      if( sqlite3_strnicmp(z,"0x",2)==0 ){
+        sqlite3ErrorMsg(pParse, "hex literal too big: %s%#T",
+                        negFlag?"-":"",pExpr);
       }else
 #endif
       {
-#ifdef SQLITE_OMIT_FLOATING_POINT
-        sqlite3ErrorMsg(pParse, "oversized integer: %s%#T", negFlag?"-":"",pExpr);
-#else
-#ifndef SQLITE_OMIT_HEX_INTEGER
-        if( sqlite3_strnicmp(z,"0x",2)==0 ){
-          sqlite3ErrorMsg(pParse, "hex literal too big: %s%#T",
-                          negFlag?"-":"",pExpr);
-        }else
-#endif
-        {
-          codeReal(v, z, negFlag, iMem);
-        }
-#endif
+        codeReal(v, z, negFlag, iMem);
       }
+#endif
     }else{
       if( negFlag ){ value = c==3 ? SMALLEST_INT64 : -value; }
       sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, iMem, 0, (u8*)&value, P4_INT64);

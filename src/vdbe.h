@@ -64,9 +64,6 @@ struct VdbeOp {
     void *p;               /* Generic pointer */
     char *z;               /* Pointer to data for string (char array) types */
     i64 *pI64;             /* Used when p4type is P4_INT64 */
-#ifdef SQLITE_128BIT_ROWID
-    sqlite3_uint128 *pI128;/* Used when p4type is P4_INT128 */
-#endif
     double *pReal;         /* Used when p4type is P4_REAL */
     FuncDef *pFunc;        /* Used when p4type is P4_FUNCDEF */
     sqlite3_context *pCtx; /* Used when p4type is P4_FUNCCTX */
@@ -148,7 +145,6 @@ typedef struct VdbeOpList VdbeOpList;
 #define P4_FUNCCTX    (-16) /* P4 is a pointer to an sqlite3_context object */
 #define P4_TABLEREF   (-17) /* Like P4_TABLE, but reference counted */
 #define P4_SUBRTNSIG  (-18) /* P4 is a SubrtnSig pointer */
-#define P4_INT128     (-19) /* P4 is a 128-bit signed integer (SQLITE_128BIT_ROWID only) */
 
 /* Error message codes for OP_Halt */
 #define P5_ConstraintNotNull 1
@@ -209,9 +205,6 @@ void sqlite3VdbeMultiLoad(Vdbe*,int,const char*,...);
 int sqlite3VdbeAddOp3(Vdbe*,int,int,int,int);
 int sqlite3VdbeAddOp4(Vdbe*,int,int,int,int,const char *zP4,int);
 int sqlite3VdbeAddOp4Dup8(Vdbe*,int,int,int,int,const u8*,int);
-#ifdef SQLITE_128BIT_ROWID
-int sqlite3VdbeAddOp4Dup16(Vdbe*,int,int,int,int,const u8*,int);
-#endif
 int sqlite3VdbeAddOp4Int(Vdbe*,int,int,int,int,int);
 int sqlite3VdbeAddFunctionCall(Parse*,int,int,int,int,const FuncDef*,int);
 void sqlite3VdbeEndCoroutine(Vdbe*,int);

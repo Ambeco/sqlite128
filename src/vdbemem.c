@@ -105,19 +105,7 @@ int sqlite3VdbeCheckMemInvariants(Mem *p){
 */
 static void vdbeMemRenderNum(int sz, char *zBuf, Mem *p){
   StrAccum acc;
-#ifdef SQLITE_128BIT_ROWID
-  assert( p->flags & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128) );
-  if( p->flags & MEM_Int128 ){
-    /* Phase 6g: decimal-render the 128-bit value via int128ToText()
-    ** (sqliteInt128.h) rather than any of the i64/double paths below,
-    ** which would misread Mem.u.i128 as the wrong union member. */
-    assert( sz>SQLITE_INT128_DIGITS+1 );
-    p->n = int128ToText(p->u.i128, zBuf);
-    return;
-  }
-#else
   assert( p->flags & (MEM_Int|MEM_Real|MEM_IntReal) );
-#endif
   assert( sz>22 );
   if( p->flags & (MEM_Int|MEM_IntReal) ){
 #if GCC_VERSION>=7000000 && GCC_VERSION<15000000 && defined(__i386__)
@@ -481,22 +469,13 @@ int sqlite3VdbeMemNulTerminate(Mem *pMem){
 ** user and the latter is an internal programming error.
 */
 int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
-  int nByte = 32;
+  const int nByte = 32;
 
   assert( pMem!=0 );
   assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
   assert( !(pMem->flags&MEM_Zero) );
   assert( !(pMem->flags&(MEM_Str|MEM_Blob)) );
-#ifdef SQLITE_128BIT_ROWID
-  assert( pMem->flags&(MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128) );
-  if( pMem->flags & MEM_Int128 ){
-    /* SQLITE_INT128_DIGITS decimal digits, a sign, and a NUL -- see
-    ** int128ToText() (sqliteInt128.h). */
-    nByte = SQLITE_INT128_DIGITS+2;
-  }
-#else
   assert( pMem->flags&(MEM_Int|MEM_Real|MEM_IntReal) );
-#endif
   assert( !sqlite3VdbeMemIsRowSet(pMem) );
   assert( EIGHT_BYTE_ALIGNMENT(pMem) );
 
@@ -511,7 +490,7 @@ int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
   assert( pMem->n==(int)sqlite3Strlen30NN(pMem->z) );
   pMem->enc = SQLITE_UTF8;
   pMem->flags |= MEM_Str|MEM_Term;
-  if( bForce ) pMem->flags &= ~(MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128);
+  if( bForce ) pMem->flags &= ~(MEM_Int|MEM_Real|MEM_IntReal);
   sqlite3VdbeChangeEncoding(pMem, enc);
   return SQLITE_OK;
 }
@@ -668,15 +647,6 @@ i64 sqlite3VdbeIntValue(const Mem *pMem){
   if( flags & (MEM_Int|MEM_IntReal) ){
     testcase( flags & MEM_IntReal );
     return pMem->u.i;
-#ifdef SQLITE_128BIT_ROWID
-  }else if( flags & MEM_Int128 ){
-    /* Truncate to the low 64 bits (Phase 6f), same "forced, possibly
-    ** lossy" convention CAST(x AS INTEGER) already documents for a
-    ** MEM_Real input -- see sqlite3VdbeMemCast()/sqlite3VdbeMemIntegerify()
-    ** above this function. */
-    testcase( flags & MEM_Int128 );
-    return (i64)int128ToU64(pMem->u.i128);
-#endif
   }else if( flags & MEM_Real ){
     return sqlite3RealToI64(pMem->u.r);
   }else if( (flags & (MEM_Str|MEM_Blob))!=0 && pMem->z!=0 ){
@@ -803,14 +773,6 @@ double sqlite3VdbeRealValue(Mem *pMem){
   assert( EIGHT_BYTE_ALIGNMENT(pMem) );
   if( pMem->flags & MEM_Real ){
     return pMem->u.r;
-#ifdef SQLITE_128BIT_ROWID
-  }else if( pMem->flags & MEM_Int128 ){
-    /* Approximate as a double (Phase 6f), possibly lossy for magnitudes
-    ** beyond a double's 53-bit mantissa -- the same trade-off already
-    ** made for a plain 64-bit MEM_Int just below. */
-    testcase( pMem->flags & MEM_Int128 );
-    return int128ToDoubleSigned(pMem->u.i128);
-#endif
   }else if( pMem->flags & (MEM_Int|MEM_IntReal) ){
     testcase( pMem->flags & MEM_IntReal );
     return (double)pMem->u.i;
@@ -934,16 +896,6 @@ int sqlite3VdbeMemNumerify(Mem *pMem){
   testcase( pMem->flags & MEM_Real );
   testcase( pMem->flags & MEM_IntReal );
   testcase( pMem->flags & MEM_Null );
-#ifdef SQLITE_128BIT_ROWID
-  testcase( pMem->flags & MEM_Int128 );
-  if( pMem->flags & MEM_Int128 ){
-    /* Already numeric (Phase 6f) -- MEM_Int128 aliases Mem.u.i128, not
-    ** Mem.z/Mem.n, so it must never fall into the Blob/Str-reparse branch
-    ** below, which would otherwise misread those fields as if this were
-    ** an unconverted string/blob value. */
-    return SQLITE_OK;
-  }
-#endif
   if( (pMem->flags & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Null))==0 ){
     int rc;
     sqlite3_int64 ix;
@@ -1102,41 +1054,6 @@ void sqlite3VdbeMemSetInt64(Mem *pMem, i64 val){
     pMem->flags = MEM_Int;
   }
 }
-
-#ifdef SQLITE_128BIT_ROWID
-/*
-** sqlite3VdbeMemSetInt128()/sqlite3VdbeMemInt128Value() are the Phase 6a
-** foundation for a 128-bit-integer Mem representation: construction and
-** access only. Nothing yet produces a MEM_Int128 value from ordinary SQL
-** (no literal, arithmetic op, or column read sets this flag) and nothing
-** yet consumes one generically (sqlite3_value_type(), comparison,
-** CAST, typeof(), and the record serial-type encoding all still only
-** recognize MEM_Int) -- those come in the later Phase 6 sub-phases.
-** Calling these two functions is presently the only way a MEM_Int128
-** value comes into being or gets read back out.
-*/
-
-/*
-** Delete any previous value and set the value stored in *pMem to val,
-** manifest type INTEGER, 128-bit representation.
-*/
-void sqlite3VdbeMemSetInt128(Mem *pMem, sqlite3_uint128 val){
-  sqlite3VdbeMemSetNull(pMem);
-  pMem->u.i128 = val;
-  pMem->flags = MEM_Int128;
-}
-
-/*
-** Return the 128-bit integer value of pMem. pMem must have MEM_Int128
-** set (an ordinary MEM_Int value is NOT widened here -- that
-** conversion, if wanted, belongs to a later Phase 6 sub-phase once
-** general arithmetic/coercion between the two representations exists).
-*/
-sqlite3_uint128 sqlite3VdbeMemInt128Value(const Mem *pMem){
-  assert( pMem->flags & MEM_Int128 );
-  return pMem->u.i128;
-}
-#endif /* SQLITE_128BIT_ROWID */
 
 /*
 ** Set the iIdx'th entry of array aMem[] to contain integer value val.

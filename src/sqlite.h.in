@@ -5047,25 +5047,6 @@ int sqlite3_bind_blob64(sqlite3_stmt*, int, const void*, sqlite3_uint64,
 int sqlite3_bind_double(sqlite3_stmt*, int, double);
 int sqlite3_bind_int(sqlite3_stmt*, int, int);
 int sqlite3_bind_int64(sqlite3_stmt*, int, sqlite3_int64);
-#ifdef SQLITE_128BIT_ROWID
-/*
-** CAPI3REF: Binding A 128-Bit Integer Value To A Prepared Statement
-** METHOD: sqlite3_stmt
-**
-** Bind a signed 128-bit (two's-complement) integer value to a prepared
-** statement parameter, in a SQLITE_128BIT_ROWID build (Phase 6i). The
-** value is passed as two 64-bit limbs rather than a single wider C type,
-** so that this declaration is portable regardless of whether the
-** compiler used to build the caller's application supports a native
-** 128-bit integer type: hiValue holds the sign-extended upper 64 bits,
-** loValue the lower 64 bits, of the two's-complement representation --
-** i.e. the full value is (((sqlite3_int64)hiValue)<<64) | loValue.
-**
-** See also: [sqlite3_column_int128()].
-*/
-int sqlite3_bind_int128(sqlite3_stmt*, int, sqlite3_int64 hiValue,
-                         sqlite3_uint64 loValue);
-#endif
 int sqlite3_bind_null(sqlite3_stmt*, int);
 int sqlite3_bind_text(sqlite3_stmt*,int,const char*,int,void(*)(void*));
 int sqlite3_bind_text16(sqlite3_stmt*, int, const void*, int, void(*)(void*));
@@ -5635,24 +5616,6 @@ const void *sqlite3_column_blob(sqlite3_stmt*, int iCol);
 double sqlite3_column_double(sqlite3_stmt*, int iCol);
 int sqlite3_column_int(sqlite3_stmt*, int iCol);
 sqlite3_int64 sqlite3_column_int64(sqlite3_stmt*, int iCol);
-#ifdef SQLITE_128BIT_ROWID
-/*
-** CAPI3REF: 128-Bit Integer Result Value From A Query
-** METHOD: sqlite3_stmt
-**
-** Read the value of a result column as a signed 128-bit (two's-
-** complement) integer, in a SQLITE_128BIT_ROWID build (Phase 6i).
-** *pHi is set to the sign-extended upper 64 bits, *pLo to the lower
-** 64 bits -- see [sqlite3_bind_int128()] for the exact convention. A
-** column that does not hold a 128-bit integer value is widened/coerced
-** the same way [sqlite3_column_int64()] already does for that column's
-** actual type (a sign-extended 64-bit value, i.e. *pHi is entirely 0x00
-** or 0xff bytes), so this can always be called safely regardless of the
-** column's actual type.
-*/
-void sqlite3_column_int128(sqlite3_stmt*, int iCol, sqlite3_int64 *pHi,
-                            sqlite3_uint64 *pLo);
-#endif
 const unsigned char *sqlite3_column_text(sqlite3_stmt*, int iCol);
 const void *sqlite3_column_text16(sqlite3_stmt*, int iCol);
 sqlite3_value *sqlite3_column_value(sqlite3_stmt*, int iCol);
@@ -6209,20 +6172,6 @@ const void *sqlite3_value_blob(sqlite3_value*);
 double sqlite3_value_double(sqlite3_value*);
 int sqlite3_value_int(sqlite3_value*);
 sqlite3_int64 sqlite3_value_int64(sqlite3_value*);
-#ifdef SQLITE_128BIT_ROWID
-/*
-** CAPI3REF: 128-Bit Integer Value From An SQL Function Parameter
-**
-** Read an [sqlite3_value] as a signed 128-bit (two's-complement)
-** integer, in a SQLITE_128BIT_ROWID build (Phase 6i) -- the
-** [sqlite3_value*] analog of [sqlite3_column_int128()], for use inside
-** an application-defined SQL function's implementation to read one of
-** its arguments at full 128-bit precision. See [sqlite3_bind_int128()]
-** for the hi/lo convention.
-*/
-void sqlite3_value_int128(sqlite3_value*, sqlite3_int64 *pHi,
-                           sqlite3_uint64 *pLo);
-#endif
 void *sqlite3_value_pointer(sqlite3_value*, const char*);
 const unsigned char *sqlite3_value_text(sqlite3_value*);
 const void *sqlite3_value_text16(sqlite3_value*);
@@ -6681,21 +6630,6 @@ void sqlite3_result_error_nomem(sqlite3_context*);
 void sqlite3_result_error_code(sqlite3_context*, int);
 void sqlite3_result_int(sqlite3_context*, int);
 void sqlite3_result_int64(sqlite3_context*, sqlite3_int64);
-#ifdef SQLITE_128BIT_ROWID
-/*
-** CAPI3REF: Setting The Result Of An SQL Function To A 128-Bit Integer
-** METHOD: sqlite3_context
-**
-** Set the result of an application-defined SQL function to a signed
-** 128-bit (two's-complement) integer, in a SQLITE_128BIT_ROWID build
-** (Phase 7) -- the [sqlite3_result_int64()] analog for 128-bit values.
-** See [sqlite3_bind_int128()] for the hi/lo convention. This is what
-** lets a function such as uuid_int() (ext/misc/uuid.c) return a genuine
-** SQLITE_INTEGER-typed 128-bit value instead of a 16-byte BLOB.
-*/
-void sqlite3_result_int128(sqlite3_context*, sqlite3_int64 hiValue,
-                            sqlite3_uint64 loValue);
-#endif
 void sqlite3_result_null(sqlite3_context*);
 void sqlite3_result_text(sqlite3_context*, const char*, int, void(*)(void*));
 void sqlite3_result_text64(sqlite3_context*, const char *z, sqlite3_uint64 n,

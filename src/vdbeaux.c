@@ -483,27 +483,6 @@ int sqlite3VdbeAddOp4Dup8(
   return sqlite3VdbeAddOp4(p, op, p1, p2, p3, p4copy, p4type);
 }
 
-#ifdef SQLITE_128BIT_ROWID
-/*
-** Add an opcode that includes the p4 value with a P4_INT128 type
-** (Phase 6h). 16-byte analog of sqlite3VdbeAddOp4Dup8() just above, for
-** OP_Int128.
-*/
-int sqlite3VdbeAddOp4Dup16(
-  Vdbe *p,            /* Add the opcode to this VM */
-  int op,             /* The new opcode */
-  int p1,             /* The P1 operand */
-  int p2,             /* The P2 operand */
-  int p3,             /* The P3 operand */
-  const u8 *zP4,      /* The P4 operand */
-  int p4type          /* P4 operand type */
-){
-  char *p4copy = sqlite3DbMallocRawNN(sqlite3VdbeDb(p), 16);
-  if( p4copy ) memcpy(p4copy, zP4, 16);
-  return sqlite3VdbeAddOp4(p, op, p1, p2, p3, p4copy, p4type);
-}
-#endif /* SQLITE_128BIT_ROWID */
-
 #ifndef SQLITE_OMIT_EXPLAIN
 /*
 ** Return the address of the current EXPLAIN QUERY PLAN baseline.
@@ -1412,7 +1391,6 @@ static void freeP4(sqlite3 *db, int p4type, void *p4){
     }
     case P4_REAL:
     case P4_INT64:
-    case P4_INT128:
     case P4_DYNAMIC:
     case P4_INTARRAY: {
       if( p4 ) sqlite3DbNNFreeNN(db, p4);
@@ -1982,14 +1960,6 @@ char *sqlite3VdbeDisplayP4(sqlite3 *db, Op *pOp){
       sqlite3_str_appendf(&x, "%lld", *pOp->p4.pI64);
       break;
     }
-#ifdef SQLITE_128BIT_ROWID
-    case P4_INT128: {
-      char zBuf[SQLITE_INT128_DIGITS+2];
-      int128ToText(*pOp->p4.pI128, zBuf);
-      sqlite3_str_appendf(&x, "%s", zBuf);
-      break;
-    }
-#endif
     case P4_INT32: {
       sqlite3_str_appendf(&x, "%d", pOp->p4.i);
       break;
@@ -4023,18 +3993,6 @@ const u8 sqlite3SmallTypeSizes[128] = {
 ** Return the length of the data corresponding to the supplied serial-type.
 */
 u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
-#ifdef SQLITE_128BIT_ROWID
-  /* Serial type 11 is repurposed under SQLITE_128BIT_ROWID as a 16-byte
-  ** 128-bit integer (see sqlite3VdbeSerialGet()'s case 11) rather than
-  ** the generic "reserved, 0 bytes" every other build treats it as.
-  ** Special-cased here rather than in the shared sqlite3SmallTypeSizes
-  ** table itself, so every *other* caller of that table (e.g. the
-  ** record-comparison fast path, sqlite3VdbeIdxRowid's index-rowid
-  ** length lookup) is completely unaffected by this build flag -- only
-  ** callers that go through this wrapper (or the one below) see the
-  ** new length. */
-  if( serial_type==11 ) return 16;
-#endif
   if( serial_type>=128 ){
     return (serial_type-12)/2;
   }else{
@@ -4045,10 +4003,7 @@ u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
 }
 u8 sqlite3VdbeOneByteSerialTypeLen(u8 serial_type){
   assert( serial_type<128 );
-#ifdef SQLITE_128BIT_ROWID
-  if( serial_type==11 ) return 16;
-#endif
-  return sqlite3SmallTypeSizes[serial_type];
+  return sqlite3SmallTypeSizes[serial_type]; 
 }
 
 /*
@@ -4141,32 +4096,7 @@ void sqlite3VdbeSerialGet(
       pMem->u.nZero = 0;
       return;
     }
-#ifdef SQLITE_128BIT_ROWID
-    case 11: { /* 16-byte, 128-bit twos-complement integer.
-               ** SQLITE_128BIT_ROWID only -- see Phase 6b. A build
-               ** without SQLITE_128BIT_ROWID falls through to the
-               ** default 'reserved, treat as NULL' case below,
-               ** unchanged from before this feature existed; only a
-               ** wide-rowid-capable build can ever actually write this
-               ** serial type (see the OP_MakeRecord encoder, vdbe.c),
-               ** so a narrow build should never encounter one for real. */
-      /* Big-endian on the wire, like every other multi-byte integer
-      ** serial type here: the high 8 bytes (the sign-bearing half, for
-      ** twos-complement) come first. Built via the portable int128*
-      ** helpers (sqliteInt128.h) rather than reaching into
-      ** sqlite3_uint128's representation directly, since that
-      ** representation differs between the SQLITE_USE_UINT128 (native
-      ** __uint128_t) and portable (quads[2] struct) builds. */
-      u64 hi = sqlite3Get8byte(buf);
-      u64 lo = sqlite3Get8byte(buf+8);
-      pMem->u.i128 = int128Add(int128ShiftLeft(int128FromU64(hi), 64),
-                                int128FromU64(lo));
-      pMem->flags = MEM_Int128;
-      return;
-    }
-#else
     case 11:   /* Reserved for future use */
-#endif
     case 0: {  /* Null */
       /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
       pMem->flags = MEM_Null;
@@ -4605,40 +4535,6 @@ int sqlite3IntFloatCompare(i64 i, double r){
   }
 }
 
-#ifdef SQLITE_128BIT_ROWID
-/*
-** Do a comparison between a signed (two's-complement) 128-bit integer and
-** a 64-bit floating-point number.  Return negative, zero, or positive if
-** the first (i128) is less than, equal to, or greater than the second
-** (double). This is the Phase 6c (comparison) analog of
-** sqlite3IntFloatCompare() above, sized for sqlite3_uint128 -- see that
-** function's comment for the general strategy (exact integer comparison
-** first, then a double tie-break for any fractional part of r).
-*/
-int sqlite3Int128FloatCompare(sqlite3_uint128 i, double r){
-  if( sqlite3IsNaN(r) ){
-    /* SQLite considers NaN to be a NULL. And all integer values are greater
-    ** than NULL */
-    return 1;
-  }else{
-    sqlite3_uint128 y;
-    int c;
-    double di;
-    /* 2^127, exactly representable as a double */
-    if( r<-170141183460469231731687303715884105728.0 ) return +1;
-    if( r>=170141183460469231731687303715884105728.0 ) return -1;
-    y = int128FromDoubleSigned(r);
-    c = int128CompareSigned(i, y);
-    if( c!=0 ) return c;
-    di = int128ToDoubleSigned(i);
-    testcase( doubleLt(di,r) );
-    testcase( doubleLt(r,di) );
-    testcase( doubleEq(r,di) );
-    return (di<r) ? -1 : (di>r);
-  }
-}
-#endif /* SQLITE_128BIT_ROWID */
-
 /*
 ** Compare the values contained by the two memory cells, returning
 ** negative, zero or positive if pMem1 is less than, equal to, or greater
@@ -4663,38 +4559,6 @@ int sqlite3MemCompare(const Mem *pMem1, const Mem *pMem2, const CollSeq *pColl){
   if( combined_flags&MEM_Null ){
     return (f2&MEM_Null) - (f1&MEM_Null);
   }
-
-#ifdef SQLITE_128BIT_ROWID
-  /* At least one of the two values is a 128-bit integer (Phase 6c). Handle
-  ** this before the plain-numeric branch below: Mem.u.i128 and Mem.u.i/
-  ** Mem.u.r alias the same union member, so a Mem carrying MEM_Int128 must
-  ** never be read as if MEM_Int or MEM_Real were set, or vice versa. A
-  ** narrow (non-SQLITE_128BIT_ROWID) build can never produce a Mem with
-  ** MEM_Int128 set, so this whole branch is compiled out there. */
-  if( combined_flags&MEM_Int128 ){
-    if( (f1 & f2 & MEM_Int128)!=0 ){
-      return int128CompareSigned(pMem1->u.i128, pMem2->u.i128);
-    }
-    if( (f1 & MEM_Int128)!=0 ){
-      if( (f2 & (MEM_Int|MEM_IntReal))!=0 ){
-        return int128CompareSigned(pMem1->u.i128, int128FromI64(pMem2->u.i));
-      }else if( (f2 & MEM_Real)!=0 ){
-        return sqlite3Int128FloatCompare(pMem1->u.i128, pMem2->u.r);
-      }else{
-        return -1;
-      }
-    }else{
-      /* f2 has MEM_Int128 set, f1 does not */
-      if( (f1 & (MEM_Int|MEM_IntReal))!=0 ){
-        return -int128CompareSigned(pMem2->u.i128, int128FromI64(pMem1->u.i));
-      }else if( (f1 & MEM_Real)!=0 ){
-        return -sqlite3Int128FloatCompare(pMem2->u.i128, pMem1->u.r);
-      }else{
-        return +1;
-      }
-    }
-  }
-#endif /* SQLITE_128BIT_ROWID */
 
   /* At least one of the two values is a number
   */

@@ -402,11 +402,6 @@ static void applyAffinity(
   if( affinity>=SQLITE_AFF_NUMERIC ){
     assert( affinity==SQLITE_AFF_INTEGER || affinity==SQLITE_AFF_REAL
              || affinity==SQLITE_AFF_NUMERIC || affinity==SQLITE_AFF_FLEXNUM );
-    /* Phase 6f: a MEM_Int128 pRec has none of MEM_Int/MEM_Real/MEM_IntReal/
-    ** MEM_Str set, so both branches below are already correctly skipped
-    ** for it -- it's already numeric (more precisely so than any affinity
-    ** here could ask for), and there is no string representation to
-    ** reparse. No code change needed, just noting it's not an oversight. */
     if( (pRec->flags & MEM_Int)==0 ){ /*OPTIMIZATION-IF-FALSE*/
       if( (pRec->flags & (MEM_Real|MEM_IntReal))==0 ){
         if( pRec->flags & MEM_Str ) applyNumericAffinity(pRec,1);
@@ -421,15 +416,14 @@ static void applyAffinity(
     ** there is already a string rep, but it is pointless to waste those
     ** CPU cycles. */
     if( 0==(pRec->flags&MEM_Str) ){ /*OPTIMIZATION-IF-FALSE*/
-      if( (pRec->flags&(MEM_Real|MEM_Int|MEM_IntReal|MEM_Int128)) ){
+      if( (pRec->flags&(MEM_Real|MEM_Int|MEM_IntReal)) ){
         testcase( pRec->flags & MEM_Int );
         testcase( pRec->flags & MEM_Real );
         testcase( pRec->flags & MEM_IntReal );
-        testcase( pRec->flags & MEM_Int128 );
         sqlite3VdbeMemStringify(pRec, enc, 1);
       }
     }
-    pRec->flags &= ~(MEM_Real|MEM_Int|MEM_IntReal|MEM_Int128);
+    pRec->flags &= ~(MEM_Real|MEM_Int|MEM_IntReal);
   }
 }
 
@@ -1449,21 +1443,6 @@ case OP_Int64: {           /* out2 */
   break;
 }
 
-#ifdef SQLITE_128BIT_ROWID
-/* Opcode: Int128 * P2 * P4 *
-** Synopsis: r[P2]=P4
-**
-** P4 is a pointer to a 128-bit integer value (SQLITE_128BIT_ROWID builds
-** only -- see Phase 6h). Write that value into register P2.
-*/
-case OP_Int128: {          /* out2 */
-  pOut = out2Prerelease(p, pOp);
-  assert( pOp->p4.pI128!=0 );
-  sqlite3VdbeMemSetInt128(pOut, *pOp->p4.pI128);
-  break;
-}
-#endif /* SQLITE_128BIT_ROWID */
-
 #ifndef SQLITE_OMIT_FLOATING_POINT
 /* Opcode: Real * P2 * P4 *
 ** Synopsis: r[P2]=P4
@@ -1982,107 +1961,6 @@ case OP_Remainder: {           /* same as TK_REM, in1, in2, out3 */
   pIn2 = &aMem[pOp->p2];
   type2 = pIn2->flags;
   pOut = &aMem[pOp->p3];
-#ifdef SQLITE_128BIT_ROWID
-  /* Phase 6d: if either operand is a 128-bit integer, do the math at 128
-  ** bits instead of falling into the ordinary MEM_Int/numericType() path
-  ** below, which does not know about MEM_Int128 (Phase 6f) and would
-  ** either misroute it or read Mem.u.i/Mem.u.r out of the wrong union
-  ** member. The other operand, if not itself MEM_Int128, is widened:
-  ** MEM_Int/MEM_IntReal exactly (int128FromI64), MEM_Real/anything else
-  ** approximately (through a double), same precision trade-off the
-  ** ordinary int/real mixed math below already makes. */
-  if( ((type1|type2) & MEM_Int128)!=0 ){
-    sqlite3_uint128 wA, wB;
-    int rcOverflow = 0;
-
-    if( (type1 & MEM_Int128)!=0 ){
-      wA = pIn1->u.i128;
-    }else if( (type1 & (MEM_Int|MEM_IntReal))!=0 ){
-      wA = int128FromI64(pIn1->u.i);
-    }else if( (type1 & MEM_Real)!=0 ){
-      wA = int128FromDoubleSigned(pIn1->u.r);
-    }else if( (type1 & MEM_Null)!=0 || (type2 & MEM_Null)!=0 ){
-      goto arithmetic_result_is_null;
-    }else{
-      wA = int128FromDoubleSigned(sqlite3VdbeRealValue(pIn1));
-    }
-    if( (type2 & MEM_Int128)!=0 ){
-      wB = pIn2->u.i128;
-    }else if( (type2 & (MEM_Int|MEM_IntReal))!=0 ){
-      wB = int128FromI64(pIn2->u.i);
-    }else if( (type2 & MEM_Real)!=0 ){
-      wB = int128FromDoubleSigned(pIn2->u.r);
-    }else if( (type1 & MEM_Null)!=0 || (type2 & MEM_Null)!=0 ){
-      goto arithmetic_result_is_null;
-    }else{
-      wB = int128FromDoubleSigned(sqlite3VdbeRealValue(pIn2));
-    }
-
-    switch( pOp->opcode ){
-      case OP_Add:       rcOverflow = int128AddOverflow(&wB, wA);  break;
-      case OP_Subtract:  rcOverflow = int128SubOverflow(&wB, wA);  break;
-      case OP_Multiply:  rcOverflow = int128MulOverflow(&wB, wA);  break;
-      case OP_Divide: {
-        sqlite3_uint128 q, r;
-        sqlite3_uint128 smallest128 = int128ShiftLeft(int128FromU64(1),127);
-        if( int128IsZero(wA) ) goto arithmetic_result_is_null;
-        if( int128Compare(wA,int128FromI64(-1))==0
-         && int128Compare(wB,smallest128)==0 ){
-          rcOverflow = 1;  /* -2^127 / -1 doesn't fit back in 128 bits */
-        }else{
-          int128DivMod(wB, wA, &q, &r);
-          wB = q;
-        }
-        break;
-      }
-      default: {        /* OP_Remainder -- can never overflow */
-        sqlite3_uint128 q, r;
-        if( int128IsZero(wA) ) goto arithmetic_result_is_null;
-        if( int128Compare(wA,int128FromI64(-1))==0 ) wA = int128FromU64(1);
-        int128DivMod(wB, wA, &q, &r);
-        wB = r;
-        break;
-      }
-    }
-
-    if( rcOverflow ){
-      /* Overflow: fall back to floating point, same policy as the 64-bit
-      ** path's "goto fp_math" -- but computed locally from wA/wB (already
-      ** widened above) rather than by jumping to fp_math, since that label
-      ** re-reads pIn1/pIn2 via sqlite3VdbeRealValue(), which does not yet
-      ** understand MEM_Int128 (Phase 6f). */
-      double rA128 = int128ToDoubleSigned(wA);
-      double rB128 = int128ToDoubleSigned(
-          (type2 & MEM_Int128)!=0 ? pIn2->u.i128 :
-          (type2 & (MEM_Int|MEM_IntReal))!=0 ? int128FromI64(pIn2->u.i) :
-          (type2 & MEM_Real)!=0 ? int128FromDoubleSigned(pIn2->u.r) :
-          int128FromDoubleSigned(sqlite3VdbeRealValue(pIn2)));
-      switch( pOp->opcode ){
-        case OP_Add:       rB128 += rA128;  break;
-        case OP_Subtract:  rB128 -= rA128;  break;
-        case OP_Multiply:  rB128 *= rA128;  break;
-        default:           rB128 /= rA128;  break;  /* OP_Divide; the
-                                                      ** rA128==0 case was
-                                                      ** already excluded
-                                                      ** above.
-                                                      ** OP_Remainder never
-                                                      ** sets rcOverflow. */
-      }
-#ifdef SQLITE_OMIT_FLOATING_POINT
-      pOut->u.i = (i64)rB128;
-      MemSetTypeFlag(pOut, MEM_Int);
-#else
-      if( sqlite3IsNaN(rB128) ){
-        goto arithmetic_result_is_null;
-      }
-      pOut->u.r = rB128;
-      MemSetTypeFlag(pOut, MEM_Real);
-#endif
-    }else{
-      sqlite3VdbeMemSetInt128(pOut, wB);
-    }
-  }else
-#endif /* SQLITE_128BIT_ROWID */
   if( (type1 & type2 & MEM_Int)!=0 ){
 int_math:
     iA = pIn1->u.i;
@@ -3377,25 +3255,9 @@ op_column_restart:
     zData = pC->aRow + aOffset[p2];
     switch( t ){
       case 0:
-#ifndef SQLITE_128BIT_ROWID
       case 11:
-#endif
         pDest->flags = MEM_Null;
         break;
-#ifdef SQLITE_128BIT_ROWID
-      case 11: {
-        /* 16-byte 128-bit integer. This mirrors sqlite3VdbeSerialGet()'s
-        ** case 11 (vdbeaux.c) -- this switch is that function's inlined,
-        ** OP_Column-optimized twin (see the comment above this switch),
-        ** so both copies of the decode logic have to stay in sync. */
-        u64 hi = sqlite3Get8byte(zData);
-        u64 lo = sqlite3Get8byte(zData+8);
-        pDest->u.i128 = int128Add(int128ShiftLeft(int128FromU64(hi), 64),
-                                   int128FromU64(lo));
-        pDest->flags = MEM_Int128;
-        break;
-      }
-#endif
       case 1:
         pDest->u.i = ONE_BYTE_INT(zData);
         pDest->flags = MEM_Int;
@@ -3831,19 +3693,6 @@ case OP_MakeRecord: {
         pRec->uTemp = 0;
       }
       nHdr++;
-#ifdef SQLITE_128BIT_ROWID
-    }else if( pRec->flags & MEM_Int128 ){
-      /* Serial type 11: 16-byte 128-bit integer. Unlike the MEM_Int
-      ** branch below, there is no variable-width choice to make here --
-      ** a MEM_Int128 value always needs the full 16 bytes, since (unlike
-      ** a plain 64-bit MEM_Int) there is no cheaper narrower encoding
-      ** available for it to fall back to without losing the very
-      ** property (127 bits+sign of range) that distinguishes it from an
-      ** ordinary MEM_Int in the first place. */
-      nHdr++;
-      nData += 16;
-      pRec->uTemp = 11;
-#endif
     }else if( pRec->flags & (MEM_Int|MEM_IntReal) ){
       /* Figure out whether to use 1, 2, 4, 6 or 8 bytes. */
       i64 i = pRec->u.i;
@@ -4049,22 +3898,6 @@ case OP_MakeRecord: {
       }
     }else if( serial_type<0x80 ){
       *(zHdr++) = serial_type;
-#ifdef SQLITE_128BIT_ROWID
-      if( serial_type==11 ){
-        /* 16-byte 128-bit integer, big-endian (high half first), same
-        ** convention as every other multi-byte integer serial type
-        ** above -- see sqlite3VdbeSerialGet()'s case 11 (vdbeaux.c) for
-        ** the matching decode. Reads back out via the portable int128*
-        ** helpers rather than sqlite3_uint128's representation directly
-        ** (see that decode site's comment for why). */
-        u64 hi = int128ToU64(int128ShiftRight(pRec->u.i128, 64));
-        u64 lo = int128ToU64(pRec->u.i128);
-        int ii;
-        for(ii=0; ii<8; ii++){ zPayload[ii]   = (u8)(hi>>(56-8*ii)); }
-        for(ii=0; ii<8; ii++){ zPayload[8+ii] = (u8)(lo>>(56-8*ii)); }
-        zPayload += 16;
-      }else
-#endif
       if( serial_type>=14 && pRec->n>0 ){
         assert( pRec->z!=0 );
         memcpy(zPayload, pRec->z, pRec->n);

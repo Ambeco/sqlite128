@@ -535,13 +535,7 @@ static const sqlite3_api_routines sqlite3Apis = {
 #endif
   /* Version 3.54.0 and later */
   sqlite3_incomplete,
-  sqlite3_result_str,
-#ifdef SQLITE_128BIT_ROWID
-  sqlite3_bind_int128,
-  sqlite3_column_int128,
-  sqlite3_value_int128,
-  sqlite3_result_int128,
-#endif
+  sqlite3_result_str
 };
 
 /* True if x is the directory separator character
