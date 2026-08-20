@@ -41,8 +41,8 @@ right fixed width and type at runtime:
 
 | Type | Required constraints |
 |---|---|
-| `BLOB(W)`, W≤16 | `NOT NULL`, `CHECK(length(col)=W)` |
-| `TEXT(W)`, W≤16 | `NOT NULL`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
+| `BLOB(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='blob')`, `CHECK(length(col)=W)` |
+| `TEXT(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='text')`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
 | `REAL` | `NOT NULL`, `CHECK(typeof(col)='real')` |
 
 This mirrors, deliberately, how `INTEGER PRIMARY KEY` itself already works in mainline SQLite: it's
@@ -52,6 +52,13 @@ explicit, schema-visible way a developer opts into the tradeoffs — this fork d
 **not** auto-coerce or auto-enforce these types under the hood; the constraints are how SQLite's
 existing engine (which already always enforces `CHECK`) does the enforcement, not a new bespoke
 mechanism.
+
+The `typeof(col)=...` checks matter more than they might look: `BLOB` and `TEXT` are the two
+SQLite affinities that never coerce *each other* — a column declared `BLOB` can, at runtime,
+actually hold a `TEXT` value and vice versa (SQLite's manifest typing allows it, and neither
+affinity's coercion path touches the other's type). Without the `typeof()` check, a same-byte-length
+value of the wrong type could silently satisfy the length `CHECK` and slip into what's supposed to
+be a strictly-typed rowid-backing column.
 
 **Byte/bit encoding.** Every source type applies a canonicalizing transform on the way into and out
 of the 128-bit rowid, so that one uniform *signed* 128-bit integer comparison gives the correct
@@ -77,14 +84,20 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
 **Known limitations (by design, not yet closed):**
 - Only exact `BLOB`/`TEXT`/`REAL` spellings qualify for now — no synonyms (see §4).
 - No UUID-formatted-string or blob auto-coercion — this is an explicit rowid *storage* mechanism,
-  not an implicit type-conversion feature. Existing conversion functions (`uuid_str()`,
-  `uuid_blob()`, `uuid_int()` — see `ext/misc/uuid.c`) remain the explicit way to move between
-  representations.
+  not an implicit type-conversion feature. `uuid_str()`/`uuid_blob()` (mainline SQLite functions,
+  see `ext/misc/uuid.c`) remain the explicit way to produce a UUID string or the 16-byte blob you'd
+  store in a `BLOB(16)` primary key.
 - Width is capped at 16 bytes (the size of a 128-bit rowid).
 
 ## 3. Step-by-step plan and progress
 
-This fork has been built as a sequence of small, individually-verified phases.
+This fork has been built as a sequence of small, individually-verified phases. Note that this
+project's direction shifted partway through (see §2): early phases explored storing a UUID as an
+actual 128-bit SQL `INTEGER` value; the design converged instead on storing a UUID primary key
+directly in its native `BLOB`/`TEXT` form as the table's rowid. The 128-bit-integer *engine*
+infrastructure those early phases built (Phases 1, 6) remains essential — it's what the narrow-PK
+feature's rowid is made of internally — but the SQL-user-visible "UUID as an INTEGER" framing
+(`uuid_int()`, Phase 5) has been superseded and removed; see the note at the end of Phase 7a.
 
 ### Phase 1–4: wide-rowid foundation (**done**)
 `rowid_t` typedef and core rowid abstraction; disk-I/O rowid handling and file-format width
@@ -92,8 +105,8 @@ detection; `sqlite3_uint128` arithmetic primitives (`sqliteInt128.h`); `SQLITE_1
 compiles; page-1 magic-header gate for wide-rowid files; whole-database wide-rowid codec with
 convert-only-via-SQL migration.
 
-### Phase 5: UUID extension groundwork (**done**)
-`uuid_int(x)` added to `ext/misc/uuid.c`.
+### Phase 5: UUID extension groundwork (**done, later superseded — see Phase 7a note**)
+`uuid_int(x)` added to `ext/misc/uuid.c` (this function has since been removed; see below).
 
 ### Phase 6: widen `Mem`/SQL-value handling to 128 bits (**done**, 6a–6i)
 Construction/access (6a) → record/column on-disk storage, serial type 11 (6b) → comparison (6c) →
@@ -101,13 +114,21 @@ Construction/access (6a) → record/column on-disk storage, serial type 11 (6b) 
 awareness (6f) → decimal-render/stringify support (6g) → decimal & hex SQL literal parsing plus a
 new `OP_Int128` opcode (6h) → `sqlite3_value_type()` fix and a full `sqlite3_bind_int128`/
 `sqlite3_column_int128`/`sqlite3_value_int128` C API (6i). A 128-bit `INTEGER` value is now fully
-usable everywhere in the engine: arithmetic, comparison, casting, storage, and C API access.
+usable everywhere in the engine: arithmetic, comparison, casting, storage, and C API access. This
+general-purpose capability stands on its own regardless of the narrow-PK-as-rowid feature — it's
+the internal machinery a `BLOB`/`TEXT`/`REAL` rowid is built from, and remains available for
+ordinary 128-bit integer arithmetic too.
 
 ### Phase 7: making int128 practically usable (**in progress**)
-- **7a (done):** `sqlite3_result_int128()` C API, wired into the loadable-extension API surface
-  (`sqlite3ext.h`/`loadext.c`) so extensions — not just directly-linked C code — can produce
-  128-bit results. `uuid_int()` now returns a genuine `INTEGER`-typed 128-bit value in a
-  `SQLITE_128BIT_ROWID` build, instead of a 16-byte `BLOB`.
+- **7a (done):** added `sqlite3_result_int128()` C API, wired into the loadable-extension API
+  surface (`sqlite3ext.h`/`loadext.c`) so extensions — not just directly-linked C code — can
+  produce 128-bit results; `ext/misc/uuid.c`'s `uuid_int()` was updated to use it, returning a
+  genuine `INTEGER`-typed 128-bit value instead of a 16-byte `BLOB`. **Superseded shortly after and
+  removed:** once the design moved to storing a UUID primary key directly in its native `BLOB`/
+  `TEXT` form (§2), `uuid_int()` no longer served a purpose, so it was deleted outright to keep
+  `ext/misc/uuid.c` as close to mainline SQLite's version as reasonable. The `sqlite3_result_int128()`
+  C API itself was kept — it's general-purpose infrastructure (Phase 6/6i's counterpart for
+  function results), not uuid.c-specific.
 - **Narrow-fixed-width-PK-as-rowid (planned, design complete, implementation not started):** the
   §1/§2 feature above. Full design is settled; remaining pre-implementation work is a concrete
   near-miss test-case table, exact error-message wording, and a from-scratch audit of every place

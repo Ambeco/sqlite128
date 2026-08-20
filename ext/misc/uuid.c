@@ -11,13 +11,11 @@
 ******************************************************************************
 **
 ** This SQLite extension implements functions that handling RFC-4122 UUIDs
-** Four SQL functions are implemented:
+** Three SQL functions are implemented:
 **
 **     uuid()        - generate a version 4 UUID as a string
 **     uuid_str(X)   - convert a UUID X into a well-formed UUID string
 **     uuid_blob(X)  - convert a UUID X into a 16-byte blob
-**     uuid_int(X)   - convert a UUID X into its canonical 128-bit integer
-**                     representation, as a 16-byte big-endian blob
 **
 ** The output from uuid() and uuid_str(X) are always well-formed RFC-4122
 ** UUID strings in this format:
@@ -60,29 +58,14 @@
 ** If the X input string has too few or too many digits or contains
 ** stray characters other than {, }, or -, then NULL is returned.
 **
-** uuid_int(X) accepts the same inputs as uuid_str()/uuid_blob() (a
-** UUID string in any of the accepted forms above, or an exact 16-byte
-** blob) and returns the UUID's canonical 128-bit-integer representation,
-** interpreting the same 16 bytes uuid_blob() returns as an unsigned
-** big-endian ("network" byte order) 128-bit magnitude. Network byte
-** order isn't an arbitrary choice here -- comparing two UUIDs byte-by-
-** byte (memcmp order, which is also SQLite's default BLOB collation)
-** gives exactly the same result as comparing the two 128-bit magnitudes
-** numerically, so this representation is both the UUID's defined byte
-** layout *and* directly usable wherever an ordered/sortable 128-bit
-** integer is needed -- notably as a wide rowid value in a build with
-** SQLITE_128BIT_ROWID enabled.
-**
-** In a build with SQLITE_128BIT_ROWID defined, uuid_int(X) returns a
-** genuine SQLITE_INTEGER-typed 128-bit value (via sqlite3_result_int128()
-** -- Phase 7), usable directly in arithmetic, comparison, INSERT/SELECT,
-** WHERE clauses, and so on, the same as any other integer. In a default
-** build, where the engine has no 128-bit integer type to return, it
-** falls back to producing the same 16-byte big-endian BLOB uuid_blob()
-** does (its pre-Phase-7 behavior) -- since a UUID's magnitude routinely
-** exceeds 2^63, a plain 64-bit sqlite3_result_int64() would silently
-** truncate it, which would be worse than being explicit that a default
-** build cannot represent this value as a native integer at all.
+** This extension previously (sqlite128 fork, Phase 5/7a) also provided a
+** uuid_int(X) function converting a UUID into a 128-bit-integer
+** representation. It has been removed: this fork's direction moved away
+** from storing UUIDs as an integer value at all, toward storing a UUID
+** primary key directly in its native BLOB(16)/TEXT(16) form as the
+** table's rowid (see the top-level README.md's "narrow fixed-width PK as
+** rowid" design) -- uuid_int() no longer serves a purpose, and removing
+** it keeps this file as close to mainline SQLite's uuid.c as reasonable.
 */
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
@@ -233,50 +216,6 @@ static void sqlite3UuidBlobFunc(
   sqlite3_result_blob(context, pBlob, 16, SQLITE_TRANSIENT);
 }
 
-/* Implementation of uuid_int() -- see the block comment near the top of
-** this file for the SQLITE_128BIT_ROWID-vs-default-build distinction.
-*/
-static void sqlite3UuidIntFunc(
-  sqlite3_context *context,
-  int argc,
-  sqlite3_value **argv
-){
-  unsigned char aBlob[16];
-  const unsigned char *pBlob;
-  (void)argc;
-  pBlob = sqlite3UuidInputToBlob(argv[0], aBlob);
-  if( pBlob==0 ) return;
-#ifdef SQLITE_128BIT_ROWID
-  {
-    /* Big-endian 16 bytes -> (hi,lo) limb pair for sqlite3_result_int128().
-    ** aBlob[0..7] is the high (sign-bearing, for the two's-complement
-    ** convention sqlite3_result_int128() otherwise uses) half; a UUID's
-    ** magnitude is always treated as unsigned/non-negative here, same as
-    ** uuid_blob()'s byte layout, so the top bit of aBlob[0] simply
-    ** becomes the sign bit of hiValue -- a UUID with that bit set (over
-    ** half of all UUIDs, including every RFC-4122 variant-1 UUID this
-    ** library generates) reports as numerically negative when read back
-    ** as a signed 128-bit integer. That mirrors how a 16-hex-digit hex
-    ** integer literal with its top bit set already becomes a negative
-    ** i64 today (see sqlite3DecOrHexToI64()) -- this extension has no
-    ** separate unsigned 128-bit SQL type to offer instead, and byte-order
-    ** comparison still behaves correctly (see the file-level comment)
-    ** regardless of how the sign bit reads back to the caller. */
-    sqlite3_int64 hi;
-    sqlite3_uint64 lo;
-    int i;
-    sqlite3_uint64 hiU = 0, loU = 0;
-    for(i=0; i<8; i++)  hiU = (hiU<<8) | pBlob[i];
-    for(i=8; i<16; i++) loU = (loU<<8) | pBlob[i];
-    hi = (sqlite3_int64)hiU;
-    lo = loU;
-    sqlite3_result_int128(context, hi, lo);
-  }
-#else
-  sqlite3_result_blob(context, pBlob, 16, SQLITE_TRANSIENT);
-#endif
-}
-
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
@@ -299,11 +238,6 @@ int sqlite3_uuid_init(
     rc = sqlite3_create_function(db, "uuid_blob", 1,
                        SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
                        0, sqlite3UuidBlobFunc, 0, 0);
-  }
-  if( rc==SQLITE_OK ){
-    rc = sqlite3_create_function(db, "uuid_int", 1,
-                       SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
-                       0, sqlite3UuidIntFunc, 0, 0);
   }
   return rc;
 }
