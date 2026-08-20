@@ -359,4 +359,55 @@ static SQLITE_INLINE int int128MulOverflow(sqlite3_uint128 *pA, sqlite3_uint128 
   return 0;
 }
 
+/* Maximum number of decimal digits in 2^127-1 (the largest positive
+** signed 128-bit value), not counting a sign: 1701411834...728 is 39
+** digits. Callers sizing a buffer for int128ToText() need room for a
+** leading '-' plus this many digits plus a NUL, i.e. at least
+** SQLITE_INT128_DIGITS+2 bytes. */
+#define SQLITE_INT128_DIGITS 39
+
+/* Render a signed (two's-complement) sqlite3_uint128 as decimal text.
+** zOut[] must be at least SQLITE_INT128_DIGITS+2 bytes. Returns the
+** length of the string written, not counting the NUL terminator --
+** same calling convention as sqlite3Int64ToText() (util.c), which this
+** is the 128-bit analog of, for Phase 6g (sqlite3VdbeMemStringify()).
+**
+** Implemented as repeated division by 10 via int128DivModU() rather
+** than sqlite3Int64ToText()'s chunked-by-100/digit-pair-table approach,
+** since a full 128-bit value doesn't reduce to a u64 fast path the way
+** i64 does; this is only reached for magnitudes that overflow 64 bits
+** in the first place, which is rare.
+*/
+static SQLITE_INLINE int int128ToText(sqlite3_uint128 v, char *zOut){
+  char buf[SQLITE_INT128_DIGITS];
+  int i = SQLITE_INT128_DIGITS;
+  int neg = int128IsNegative(v);
+  sqlite3_uint128 x = neg ? int128Negate(v) : v;
+  sqlite3_uint128 ten = int128FromU64(10);
+  int n;
+  if( int128IsZero(x) ){
+    zOut[0] = '0';
+    zOut[1] = 0;
+    return 1;
+  }
+  while( !int128IsZero(x) ){
+    sqlite3_uint128 q, r;
+    int128DivModU(x, ten, &q, &r);
+    assert( i>0 );
+    buf[--i] = (char)('0' + (int)int128ToU64(r));
+    x = q;
+  }
+  n = SQLITE_INT128_DIGITS - i;
+  if( neg ){
+    zOut[0] = '-';
+    memcpy(zOut+1, &buf[i], n);
+    zOut[n+1] = 0;
+    return n+1;
+  }else{
+    memcpy(zOut, &buf[i], n);
+    zOut[n] = 0;
+    return n;
+  }
+}
+
 #endif /* SQLITE_INT128_H */

@@ -334,18 +334,23 @@ struct sqlite3_value {
                                 ** rowid_t/int128 helpers) for how a
                                 ** default build's plain MEM_Int continues
                                 ** to cover every case there. This bit is
-                                ** NOT part of MEM_AffMask/MEM_TypeMask
-                                ** yet: it is constructible/readable via
-                                ** sqlite3VdbeMemSetInt128()/
+                                ** part of MEM_TypeMask (though not
+                                ** MEM_AffMask); it is constructible/
+                                ** readable via sqlite3VdbeMemSetInt128()/
                                 ** sqlite3VdbeMemInt128Value() (vdbemem.c),
                                 ** round-trips through the record/column
-                                ** serial-type-11 encoding (Phase 6b), and
+                                ** serial-type-11 encoding (Phase 6b),
                                 ** is recognized by sqlite3MemCompare()
-                                ** (Phase 6c). It is not yet recognized by
-                                ** sqlite3_value_type(), arithmetic, CAST,
-                                ** applyAffinity()/sqlite3VdbeMemNumerify(),
-                                ** or stringification -- those are later,
-                                ** separate sub-phases. */
+                                ** (Phase 6c), by the arithmetic opcodes
+                                ** (Phase 6d), by applyAffinity()/
+                                ** sqlite3VdbeMemNumerify()/
+                                ** sqlite3VdbeIntValue()/
+                                ** sqlite3VdbeRealValue() (Phase 6f), and
+                                ** by sqlite3VdbeMemStringify()/CAST-to-TEXT
+                                ** (Phase 6g). It is not yet recognized by
+                                ** sqlite3_value_type() or produced by SQL
+                                ** literal parsing -- those are later,
+                                ** separate sub-phases (6h/6i). */
 #define MEM_Cleared   0x0100   /* NULL set by OP_Null, not from data */
 #define MEM_Term      0x0200   /* String in Mem.z is zero terminated */
 #define MEM_Zero      0x0400   /* Mem.i contains count of 0s appended to blob */

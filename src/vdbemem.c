@@ -105,7 +105,19 @@ int sqlite3VdbeCheckMemInvariants(Mem *p){
 */
 static void vdbeMemRenderNum(int sz, char *zBuf, Mem *p){
   StrAccum acc;
+#ifdef SQLITE_128BIT_ROWID
+  assert( p->flags & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128) );
+  if( p->flags & MEM_Int128 ){
+    /* Phase 6g: decimal-render the 128-bit value via int128ToText()
+    ** (sqliteInt128.h) rather than any of the i64/double paths below,
+    ** which would misread Mem.u.i128 as the wrong union member. */
+    assert( sz>SQLITE_INT128_DIGITS+1 );
+    p->n = int128ToText(p->u.i128, zBuf);
+    return;
+  }
+#else
   assert( p->flags & (MEM_Int|MEM_Real|MEM_IntReal) );
+#endif
   assert( sz>22 );
   if( p->flags & (MEM_Int|MEM_IntReal) ){
 #if GCC_VERSION>=7000000 && GCC_VERSION<15000000 && defined(__i386__)
@@ -469,13 +481,22 @@ int sqlite3VdbeMemNulTerminate(Mem *pMem){
 ** user and the latter is an internal programming error.
 */
 int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
-  const int nByte = 32;
+  int nByte = 32;
 
   assert( pMem!=0 );
   assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
   assert( !(pMem->flags&MEM_Zero) );
   assert( !(pMem->flags&(MEM_Str|MEM_Blob)) );
+#ifdef SQLITE_128BIT_ROWID
+  assert( pMem->flags&(MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128) );
+  if( pMem->flags & MEM_Int128 ){
+    /* SQLITE_INT128_DIGITS decimal digits, a sign, and a NUL -- see
+    ** int128ToText() (sqliteInt128.h). */
+    nByte = SQLITE_INT128_DIGITS+2;
+  }
+#else
   assert( pMem->flags&(MEM_Int|MEM_Real|MEM_IntReal) );
+#endif
   assert( !sqlite3VdbeMemIsRowSet(pMem) );
   assert( EIGHT_BYTE_ALIGNMENT(pMem) );
 
@@ -490,7 +511,7 @@ int sqlite3VdbeMemStringify(Mem *pMem, u8 enc, u8 bForce){
   assert( pMem->n==(int)sqlite3Strlen30NN(pMem->z) );
   pMem->enc = SQLITE_UTF8;
   pMem->flags |= MEM_Str|MEM_Term;
-  if( bForce ) pMem->flags &= ~(MEM_Int|MEM_Real|MEM_IntReal);
+  if( bForce ) pMem->flags &= ~(MEM_Int|MEM_Real|MEM_IntReal|MEM_Int128);
   sqlite3VdbeChangeEncoding(pMem, enc);
   return SQLITE_OK;
 }

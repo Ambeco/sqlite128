@@ -421,21 +421,15 @@ static void applyAffinity(
     ** there is already a string rep, but it is pointless to waste those
     ** CPU cycles. */
     if( 0==(pRec->flags&MEM_Str) ){ /*OPTIMIZATION-IF-FALSE*/
-      if( (pRec->flags&(MEM_Real|MEM_Int|MEM_IntReal)) ){
+      if( (pRec->flags&(MEM_Real|MEM_Int|MEM_IntReal|MEM_Int128)) ){
         testcase( pRec->flags & MEM_Int );
         testcase( pRec->flags & MEM_Real );
         testcase( pRec->flags & MEM_IntReal );
+        testcase( pRec->flags & MEM_Int128 );
         sqlite3VdbeMemStringify(pRec, enc, 1);
       }
-      /* A MEM_Int128 pRec is not covered by the condition above (its
-      ** MEM_Int128 bit isn't in that mask), so TEXT affinity is still a
-      ** silent no-op for it -- correct in the sense that it neither
-      ** crashes nor corrupts pRec, but a MEM_Int128 value doesn't yet get
-      ** an actual string representation here. That needs
-      ** sqlite3VdbeMemStringify() to understand MEM_Int128 first
-      ** (Phase 6g), which it does not yet. */
     }
-    pRec->flags &= ~(MEM_Real|MEM_Int|MEM_IntReal);
+    pRec->flags &= ~(MEM_Real|MEM_Int|MEM_IntReal|MEM_Int128);
   }
 }
 
