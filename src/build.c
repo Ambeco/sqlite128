@@ -1325,6 +1325,7 @@ void sqlite3StartTable(
   }
   pTable->zName = zName;
   pTable->iPKey = -1;
+  pTable->iNarrowPKCandidate = -1;
   pTable->pSchema = db->aDb[iDb].pSchema;
   pTable->nTabRef = 1;
 #ifdef SQLITE_DEFAULT_ROWEST
@@ -1828,6 +1829,72 @@ static void makeColumnPartOfPrimaryKey(Parse *pParse, Column *pCol){
 }
 
 /*
+** Narrow-fixed-width-PK-as-rowid (README.md) maximum BLOB/TEXT width.
+** rowid_t is only 128 bits (16 bytes) wide in a SQLITE_128BIT_ROWID
+** build (see sqliteInt128.h/Phase 1-4) -- in a default build it's still
+** a plain 64-bit i64, which can only ever hold up to 8 bytes. REAL is
+** unaffected (always exactly 8 bytes, fits either way).
+*/
+#ifdef SQLITE_128BIT_ROWID
+# define NARROWPK_MAX_WIDTH 16
+#else
+# define NARROWPK_MAX_WIDTH 8
+#endif
+
+/*
+** Narrow-fixed-width-PK-as-rowid (README.md). If pCol's declared type,
+** ignoring any parenthesized width/precision suffix and surrounding
+** whitespace, spells exactly "BLOB", "TEXT", or "REAL" (case-insensitive
+** -- deliberately no synonyms like VARCHAR/CHAR/DOUBLE/FLOAT; see
+** README.md's "Known limitations"), return the corresponding
+** COLTYPE_BLOB/COLTYPE_TEXT/COLTYPE_REAL constant. Otherwise return
+** COLTYPE_CUSTOM (0).
+**
+** If a parenthesized suffix is present and is exactly one non-negative
+** integer literal (e.g. "BLOB(16)"), set *pW to that integer. Otherwise
+** set *pW to -1 -- this is not by itself an error, just means no usable
+** width came from the type specifier (a CHECK constraint may still
+** supply one; see narrowPKFinalize()). Note that unlike Column.eCType
+** (only ever set for a *bare* exact-spelling match with no parenthesized
+** suffix at all -- see sqlite3AddColumn()'s exact sType-length-and-
+** content match against sqlite3StdType[]), this function handles both
+** the bare and width-suffixed forms uniformly, since a width specifier
+** must NOT be required for this feature to qualify (see README.md ยง2:
+** "The type's declared width specifier ... is NOT itself load-bearing").
+*/
+static u8 narrowPKTypeSpelling(Column *pCol, int *pW){
+  const char *z = sqlite3ColumnType(pCol, "");
+  int n = 0;
+  u8 kind;
+  *pW = -1;
+  while( sqlite3Isalpha((unsigned char)z[n]) ) n++;
+  if( n==4 && sqlite3_strnicmp(z, "BLOB", 4)==0 ) kind = COLTYPE_BLOB;
+  else if( n==4 && sqlite3_strnicmp(z, "TEXT", 4)==0 ) kind = COLTYPE_TEXT;
+  else if( n==4 && sqlite3_strnicmp(z, "REAL", 4)==0 ) kind = COLTYPE_REAL;
+  else return COLTYPE_CUSTOM;
+  while( sqlite3Isspace((unsigned char)z[n]) ) n++;
+  if( z[n]=='(' ){
+    int w = 0, n0;
+    n++;
+    while( sqlite3Isspace((unsigned char)z[n]) ) n++;
+    n0 = n;
+    while( sqlite3Isdigit((unsigned char)z[n]) ){
+      w = w*10 + (z[n]-'0');
+      n++;
+    }
+    if( n>n0 ){
+      while( sqlite3Isspace((unsigned char)z[n]) ) n++;
+      if( z[n]==')' && z[n+1]==0 ) *pW = w;
+      /* else: malformed/unusual suffix (e.g. "(10,2)" or trailing junk) --
+      ** leave *pW=-1. narrowPKFinalize() still treats ANY parenthesized
+      ** suffix (re-detected there via strchr, not via *pW) as a signal
+      ** even when it doesn't parse into a usable width. */
+    }
+  }
+  return kind;
+}
+
+/*
 ** Designate the PRIMARY KEY for the table.  pList is a list of names
 ** of columns that form the primary key.  If pList is NULL, then the
 ** most recently added column of the table is the primary key.
@@ -1842,8 +1909,14 @@ static void makeColumnPartOfPrimaryKey(Parse *pParse, Column *pCol){
 ** INTEGER PRIMARY KEY column.  Table.iPKey is set to -1 if there is
 ** no INTEGER PRIMARY KEY.
 **
-** If the key is not an INTEGER PRIMARY KEY, then create a unique
-** index for the key.  No index is created for INTEGER PRIMARY KEYs.
+** If the PRIMARY KEY is on a single column whose datatype is exactly
+** BLOB, TEXT, or REAL, it may likewise end up using that column as the
+** rowid -- see narrowPKTypeSpelling()/narrowPKFinalize() and README.md.
+**
+** If the key is not an INTEGER PRIMARY KEY (or a qualifying narrow
+** BLOB/TEXT/REAL PRIMARY KEY), then create a unique index for the key.
+** No index is created for INTEGER PRIMARY KEYs, nor for a narrow PK that
+** ends up qualifying.
 */
 void sqlite3AddPrimaryKey(
   Parse *pParse,    /* Parsing context */
@@ -1856,6 +1929,7 @@ void sqlite3AddPrimaryKey(
   Column *pCol = 0;
   int iCol = -1, i;
   int nTerm;
+  int wUnused;
   if( pTab==0 ) goto primary_key_exit;
   if( pTab->tabFlags & TF_HasPrimaryKey ){
     sqlite3ErrorMsg(pParse,
@@ -1904,6 +1978,22 @@ void sqlite3AddPrimaryKey(
     sqlite3ErrorMsg(pParse, "AUTOINCREMENT is only allowed on an "
        "INTEGER PRIMARY KEY");
 #endif
+  }else if( nTerm==1
+   && pCol
+   && sortOrder!=SQLITE_SO_DESC
+   && narrowPKTypeSpelling(pCol, &wUnused)!=COLTYPE_CUSTOM
+  ){
+    /* Narrow-fixed-width-PK-as-rowid candidate (README.md's "narrow
+    ** fixed-width PK as rowid" design). Do NOT build an index here, and do
+    ** NOT set iPKey yet -- whether this candidate actually qualifies
+    ** depends on CHECK constraints that may not exist yet at this point in
+    ** parsing (a CHECK can appear before or after PRIMARY KEY in the
+    ** source text) and aren't resolved to real column references until
+    ** sqlite3ResolveSelfReference() runs in sqlite3EndTable(). Defer the
+    ** whole qualify-vs-fallback-index decision to sqlite3EndTable(),
+    ** immediately after CHECK resolution -- see narrowPKFinalize(). */
+    pTab->iNarrowPKCandidate = iCol;
+    pTab->narrowPKOnError = (u8)onError;
   }else{
     sqlite3CreateIndex(pParse, 0, 0, 0, pList, onError, 0,
                            0, sortOrder, 0, SQLITE_IDXTYPE_PRIMARYKEY);
@@ -2646,6 +2736,236 @@ static void markExprListImmutable(ExprList *pList){
 #define markExprListImmutable(X)  /* no-op */
 #endif /* SQLITE_DEBUG */
 
+/*
+** Narrow-fixed-width-PK-as-rowid (README.md) CHECK-constraint matchers.
+** Operate only on an already-CHECK-resolved Expr (i.e. only ever called
+** after sqlite3ResolveSelfReference() has run on pTab->pCheck). Each
+** strict Match* function below requires the canonical syntactic form
+** only -- e.g. length(col)=16 with the function call as the LEFT operand
+** and the integer/string literal as the RIGHT operand -- not reversed
+** operands or other equivalent rewrites (deliberate MVP scoping).
+*/
+
+/* True if e is a resolved reference to column iCol of the table under
+** construction. Verified empirically (not merely assumed) that CHECK-
+** constraint self-reference resolution (sqlite3ResolveSelfReference(),
+** NC_IsCheck) sets .iColumn correctly but -- unlike ordinary query
+** column resolution -- leaves .op as TK_ID rather than rewriting it to
+** TK_COLUMN; both forms must be accepted here. */
+static int narrowPKExprIsColumnRef(Expr *e, int iCol){
+  return (e->op==TK_COLUMN || e->op==TK_ID) && e->iColumn==iCol;
+}
+
+/* True if e is length(<col#iCol>)=<int> (bCastToBlob==0) or
+** length(CAST(<col#iCol> AS BLOB))=<int> (bCastToBlob!=0); sets *pW. */
+static int narrowPKMatchLengthEq(Expr *e, int iCol, int bCastToBlob, int *pW){
+  Expr *fn, *arg;
+  if( e->op!=TK_EQ ) return 0;
+  if( !sqlite3ExprIsInteger(e->pRight, pW, 0) ) return 0;
+  fn = e->pLeft;
+  if( fn->op!=TK_FUNCTION || !ExprUseXList(fn) ) return 0;
+  if( sqlite3StrICmp(fn->u.zToken, "length")!=0 ) return 0;
+  if( fn->x.pList==0 || fn->x.pList->nExpr!=1 ) return 0;
+  arg = fn->x.pList->a[0].pExpr;
+  if( bCastToBlob ){
+    if( arg->op!=TK_CAST || sqlite3StrICmp(arg->u.zToken, "BLOB")!=0 ) return 0;
+    arg = arg->pLeft;
+  }
+  return narrowPKExprIsColumnRef(arg, iCol);
+}
+
+/* True if e is typeof(<col#iCol>)='<zExpectedType>'. */
+static int narrowPKMatchTypeofEq(Expr *e, int iCol, const char *zExpectedType){
+  Expr *fn, *arg;
+  if( e->op!=TK_EQ ) return 0;
+  if( e->pRight->op!=TK_STRING
+   || sqlite3StrICmp(e->pRight->u.zToken, zExpectedType)!=0
+  ){
+    return 0;
+  }
+  fn = e->pLeft;
+  if( fn->op!=TK_FUNCTION || !ExprUseXList(fn) ) return 0;
+  if( sqlite3StrICmp(fn->u.zToken, "typeof")!=0 ) return 0;
+  if( fn->x.pList==0 || fn->x.pList->nExpr!=1 ) return 0;
+  arg = fn->x.pList->a[0].pExpr;
+  return narrowPKExprIsColumnRef(arg, iCol);
+}
+
+/* Loose match, used only to detect the near-miss SIGNAL: true if e is a
+** call to length()/typeof() (optionally through a CAST) referencing
+** column iCol, regardless of comparison operator or operand order --
+** unlike the strict Match* functions above, this does NOT establish that
+** the CHECK actually qualifies, only that it looks like an attempt. */
+static int narrowPKExprIsLengthOrTypeofCall(Expr *e, int iCol){
+  Expr *arg;
+  if( e->op!=TK_FUNCTION || !ExprUseXList(e) ) return 0;
+  if( sqlite3StrICmp(e->u.zToken,"length")!=0
+   && sqlite3StrICmp(e->u.zToken,"typeof")!=0
+  ){
+    return 0;
+  }
+  if( e->x.pList==0 || e->x.pList->nExpr!=1 ) return 0;
+  arg = e->x.pList->a[0].pExpr;
+  if( arg->op==TK_CAST ) arg = arg->pLeft;
+  return narrowPKExprIsColumnRef(arg, iCol);
+}
+static int narrowPKExprMentionsColumn(Expr *e, int iCol){
+  if( e->op!=TK_EQ && e->op!=TK_NE && e->op!=TK_LT
+   && e->op!=TK_LE && e->op!=TK_GT && e->op!=TK_GE
+  ){
+    return 0;
+  }
+  return narrowPKExprIsLengthOrTypeofCall(e->pLeft, iCol)
+      || narrowPKExprIsLengthOrTypeofCall(e->pRight, iCol);
+}
+
+/*
+** Narrow-fixed-width-PK-as-rowid (README.md) finalization. Called from
+** sqlite3EndTable() whenever pTab->iNarrowPKCandidate>=0 (set earlier by
+** sqlite3AddPrimaryKey()), after CHECK-constraint resolution AND after
+** the STRICT-table datatype check (so a STRICT table's existing "unknown
+** datatype" error for a width-specified type like BLOB(16) -- STRICT
+** tables never allow type modifiers at all, a pre-existing, unrelated
+** mainline restriction -- is reported instead of a narrow-PK-specific
+** message; a bare BLOB/TEXT/REAL with no width specifier at all is
+** unaffected by that STRICT restriction and can still qualify).
+**
+** Resolves the pending candidate into exactly one of:
+**   (a) qualifies -- set iPKey/keyConf/tabFlags/pKeyWidth, no index built
+**       (same "no index for the rowid-alias column" treatment INTEGER
+**       PRIMARY KEY already gets);
+**   (b) a near-miss (a qualification signal is present but something
+**       required is missing or wrong) at live CREATE TABLE time
+**       (db->init.busy==0) -- raise an error;
+**   (c) no signal at all, OR the table is WITHOUT ROWID (explicit
+**       opt-out, never a candidate regardless of shape), OR a near-miss
+**       while db->init.busy!=0 (loading a pre-existing schema -- must
+**       stay lenient) -- silently fall back to building the ordinary
+**       unique index sqlite3AddPrimaryKey() would have built immediately
+**       in mainline.
+*/
+static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
+  sqlite3 *db = pParse->db;
+  int iCol = pTab->iNarrowPKCandidate;
+  Column *pCol = &pTab->aCol[iCol];
+  int wType;                       /* width from the type specifier, or -1 */
+  int kind = narrowPKTypeSpelling(pCol, &wType);
+  const char *zRaw = sqlite3ColumnType(pCol, "");
+  int hasSignal = strchr(zRaw, '(')!=0;
+  ExprList *pCheck = pTab->pCheck;
+  int bText;
+  int wCheck = -1;
+  int hasTypeofCheck = 0;
+  int hasLengthCheck = 0;
+  const char *zKindName;
+  const char *zReason = 0;
+  char *zReasonAlloc = 0;
+  int i;
+
+  pTab->iNarrowPKCandidate = -1;  /* transient -- always reset */
+  assert( kind==COLTYPE_BLOB || kind==COLTYPE_TEXT || kind==COLTYPE_REAL );
+  zKindName = kind==COLTYPE_BLOB ? "BLOB" : kind==COLTYPE_TEXT ? "TEXT" : "REAL";
+  bText = (kind==COLTYPE_TEXT);
+
+  if( pCheck ){
+    for(i=0; i<pCheck->nExpr; i++){
+      Expr *e = pCheck->a[i].pExpr;
+      int w;
+      if( kind!=COLTYPE_REAL && narrowPKMatchLengthEq(e, iCol, bText, &w) ){
+        hasLengthCheck = 1;
+        wCheck = w;
+        hasSignal = 1;
+      }else if( narrowPKMatchTypeofEq(e, iCol,
+                  kind==COLTYPE_BLOB ? "blob" :
+                  kind==COLTYPE_TEXT ? "text" : "real") ){
+        hasTypeofCheck = 1;
+        hasSignal = 1;
+      }else if( narrowPKExprMentionsColumn(e, iCol) ){
+        hasSignal = 1;
+      }
+    }
+  }
+
+  if( !hasSignal || bWithoutRowid ) goto narrowpk_fallback_index;
+
+  if( pCol->notNull==OE_None ){
+    zReason = "is missing NOT NULL";
+  }else if( !hasTypeofCheck ){
+    zReasonAlloc = sqlite3MPrintf(db, "is missing CHECK(typeof(%s)='%s')",
+        pCol->zCnName, kind==COLTYPE_BLOB?"blob":kind==COLTYPE_TEXT?"text":"real");
+  }else if( kind!=COLTYPE_REAL && !hasLengthCheck ){
+    int wSuggest = wType>=0 ? wType : NARROWPK_MAX_WIDTH;
+    if( bText ){
+      zReasonAlloc = sqlite3MPrintf(db,
+          "is missing CHECK(length(CAST(%s AS BLOB))=%d)",
+          pCol->zCnName, wSuggest);
+    }else{
+      zReasonAlloc = sqlite3MPrintf(db,
+          "is missing CHECK(length(%s)=%d)", pCol->zCnName, wSuggest);
+    }
+  }else if( kind!=COLTYPE_REAL && wType>=0 && wType!=wCheck ){
+    zReasonAlloc = sqlite3MPrintf(db,
+        "declares width %d but its CHECK constraint measures width %d -- "
+        "these must match", wType, wCheck);
+  }else if( kind!=COLTYPE_REAL && wCheck>NARROWPK_MAX_WIDTH ){
+    zReasonAlloc = sqlite3MPrintf(db,
+        "declares width %d, which exceeds the %d-byte limit for this "
+        "optimization%s", wCheck, NARROWPK_MAX_WIDTH,
+#ifdef SQLITE_128BIT_ROWID
+        ""
+#else
+        " in a default (non-SQLITE_128BIT_ROWID) build"
+#endif
+        );
+  }else if( bText ){
+    const char *zColl = sqlite3ColumnColl(pCol);
+    if( zColl!=0 && sqlite3StrICmp(zColl, "BINARY")!=0 ){
+      zReasonAlloc = sqlite3MPrintf(db,
+          "has collation %s, which this optimization requires to be BINARY",
+          zColl);
+    }
+  }
+
+  if( zReason || zReasonAlloc ){
+    if( db->init.busy==0 ){
+      char *zDeclared = wType>=0
+          ? sqlite3MPrintf(db, "%s(%d)", zKindName, wType)
+          : sqlite3MPrintf(db, "%s", zKindName);
+      sqlite3ErrorMsg(pParse,
+        "table \"%s\": primary key column \"%s\" looks like an attempt at "
+        "a narrow rowid-optimized primary key (declared %s) but %s -- add "
+        "the required constraint, or remove the width specifier to use an "
+        "ordinary (indexed) primary key instead",
+        pTab->zName, pCol->zCnName, zDeclared,
+        zReason ? zReason : zReasonAlloc);
+      sqlite3DbFree(db, zDeclared);
+      sqlite3DbFree(db, zReasonAlloc);
+      return;
+    }
+    /* db->init.busy!=0: loading a pre-existing schema. Stay lenient --
+    ** fall through to the ordinary fallback index, no error. */
+    sqlite3DbFree(db, zReasonAlloc);
+    goto narrowpk_fallback_index;
+  }
+
+  /* Qualifies. */
+  pTab->iPKey = iCol;
+  pTab->keyConf = pTab->narrowPKOnError;
+  pTab->tabFlags |= kind==COLTYPE_BLOB ? TF_PKeyIsBlob :
+                     kind==COLTYPE_TEXT ? TF_PKeyIsText : TF_PKeyIsReal;
+  pTab->pKeyWidth = kind==COLTYPE_REAL ? 8 : (u8)wCheck;
+  return;
+
+narrowpk_fallback_index: {
+    ExprList *pList;
+    Token colToken;
+    sqlite3TokenInit(&colToken, pCol->zCnName);
+    pList = sqlite3ExprListAppend(pParse, 0,
+                sqlite3ExprAlloc(db, TK_ID, &colToken, 0));
+    sqlite3CreateIndex(pParse, 0, 0, 0, pList, pTab->narrowPKOnError, 0,
+                           0, 0, 0, SQLITE_IDXTYPE_PRIMARYKEY);
+  }
+}
 
 /*
 ** This routine is called to report the final ")" that terminates
@@ -2742,7 +3062,21 @@ void sqlite3EndTable(
         pCol->notNull = OE_Abort;
         p->tabFlags |= TF_HasNotNull;
       }
-    }   
+    }
+  }
+
+  /* Narrow-fixed-width-PK-as-rowid (README.md): resolve any pending
+  ** candidate left by sqlite3AddPrimaryKey() now that pCheck is fully
+  ** resolved and the STRICT-mode datatype check above has already had
+  ** first refusal. Must run (and, on error, return) before the asserts
+  ** just below, since a near-miss error leaves iPKey<0 with no fallback
+  ** index built -- continuing past the asserts in that state would trip
+  ** them (they require iPKey>=0 or an existing PRIMARYKEY index whenever
+  ** TF_HasPrimaryKey is set). */
+  if( p->iNarrowPKCandidate>=0 ){
+    int nErrBefore = pParse->nErr;
+    narrowPKFinalize(pParse, p, (tabOpts & TF_WithoutRowid)!=0);
+    if( pParse->nErr>nErrBefore ) return;
   }
 
   assert( (p->tabFlags & TF_HasPrimaryKey)==0

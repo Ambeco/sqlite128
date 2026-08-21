@@ -2615,6 +2615,19 @@ struct Table {
 #endif
   u8 keyConf;          /* What to do in case of uniqueness conflict on iPKey */
   u8 eTabType;         /* 0: normal, 1: virtual, 2: view */
+  /* Narrow-fixed-width-PK-as-rowid (see README.md). pKeyWidth is permanent:
+  ** byte-width of the rowid encoding when iPKey's column is one of the new
+  ** BLOB/TEXT/REAL kinds (1-16 for BLOB/TEXT, always 8 for REAL); 0 for the
+  ** classic INTEGER case or when iPKey<0. Meaningful only when one of
+  ** TF_PKeyIsBlob/TF_PKeyIsText/TF_PKeyIsReal is set in tabFlags.
+  ** iNarrowPKCandidate/narrowPKOnError are transient, parse-time-only
+  ** scratch fields carrying state from sqlite3AddPrimaryKey() to
+  ** sqlite3EndTable() within a single CREATE TABLE statement -- always -1/
+  ** reset by the time sqlite3EndTable() returns (same "transient field on
+  ** an otherwise-persistent Table" pattern as Table.u.tab.addColOffset). */
+  u8 pKeyWidth;
+  i16 iNarrowPKCandidate;
+  u8 narrowPKOnError;
   union {
     struct {             /* Used by ordinary tables: */
       int addColOffset;    /* Offset in CREATE TABLE stmt to add a new column */
@@ -2670,6 +2683,12 @@ struct Table {
 #define TF_Eponymous      0x00008000 /* An eponymous virtual table */
 #define TF_Strict         0x00010000 /* STRICT mode */
 #define TF_Imposter       0x00020000 /* An imposter table */
+/* Narrow-fixed-width-PK-as-rowid (README.md): mutually exclusive with each
+** other, and only meaningful alongside iPKey>=0. Their absence with
+** iPKey>=0 means the classic INTEGER PRIMARY KEY case, unchanged. */
+#define TF_PKeyIsBlob     0x00040000 /* iPKey column is a narrow BLOB(pKeyWidth) rowid alias */
+#define TF_PKeyIsText     0x00080000 /* iPKey column is a narrow TEXT(pKeyWidth) rowid alias */
+#define TF_PKeyIsReal     0x00100000 /* iPKey column is a narrow REAL rowid alias */
 
 /*
 ** Allowed values for Table.eTabType
