@@ -41,9 +41,14 @@ right fixed width and type at runtime:
 
 | Type | Required constraints |
 |---|---|
-| `BLOB(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='blob')`, `CHECK(length(col)=W)` |
-| `TEXT(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='text')`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
+| `BLOB(W)`, W≤max | `NOT NULL`, `CHECK(typeof(col)='blob')`, `CHECK(length(col)=W)` |
+| `TEXT(W)`, W≤max | `NOT NULL`, `CHECK(typeof(col)='text')`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
 | `REAL` | `NOT NULL`, `CHECK(typeof(col)='real')` |
+
+Where max is 8 bytes in a default build and 16 bytes under `SQLITE_128BIT_ROWID` — a default
+build's rowid is still a plain 64-bit integer (only `SQLITE_128BIT_ROWID` widens it to 128 bits),
+so only widths that actually fit are ever accepted. `REAL` is always exactly 8 bytes and qualifies
+under either build.
 
 This mirrors, deliberately, how `INTEGER PRIMARY KEY` itself already works in mainline SQLite: it's
 spelling-sensitive (`INT PRIMARY KEY` does *not* get rowid-aliasing, only literally `INTEGER`
@@ -87,7 +92,7 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
   not an implicit type-conversion feature. `uuid_str()`/`uuid_blob()` (mainline SQLite functions,
   see `ext/misc/uuid.c`) remain the explicit way to produce a UUID string or the 16-byte blob you'd
   store in a `BLOB(16)` primary key.
-- Width is capped at 16 bytes (the size of a 128-bit rowid).
+- Width is capped at 8 bytes in a default build, 16 bytes under `SQLITE_128BIT_ROWID`.
 
 ## 3. Step-by-step plan and progress
 
@@ -103,18 +108,22 @@ forward, with step 1 already done.
    (`sqliteInt128.h`); `SQLITE_128BIT_ROWID` compiles; page-1 magic-header gate for wide-rowid
    files; whole-database wide-rowid codec with convert-only-via-SQL migration. This is the only
    piece of infrastructure the narrow-PK-as-rowid feature (§1/§2) actually depends on.
-2. **Schema-level detection and validation (not started).** Recognize an eligible single-column
-   `BLOB`/`TEXT`/`REAL` primary key at `CREATE TABLE` time (reusing SQLite's existing `eCType`
-   parser field), validate the required `CHECK`/`NOT NULL`/collation constraints from §2, and mark
-   the column's rowid-alias "kind" and width on the table's schema metadata.
-   - Implement the near-miss detection and error policy from §2, including the
-     `db->init.busy`-gated carve-out so opening a pre-existing database file is never affected.
-   - Write a concrete near-miss test-case table (qualifying schemas, each individual constraint
-     violation, and the "must never trigger" bare-type cases) and settle on exact error-message
-     wording.
-   - Audit every place in the codebase that currently assumes a rowid-aliased column is an
-     `INTEGER` (there are many: `insert.c`, `update.c`, the query planner's seek paths, `fkey.c`,
-     and more) to scope the remaining steps accurately.
+2. **Schema-level detection and validation (done).** At `CREATE TABLE` time, a single-column
+   `BLOB`/`TEXT`/`REAL` primary key with the required `CHECK`/`NOT NULL`/collation constraints now
+   becomes a rowid alias (`Table.iPKey`), same as `INTEGER PRIMARY KEY` — no separate index is
+   built. Implemented as a deferred decision: `sqlite3AddPrimaryKey()` records a candidate rather
+   than building an index immediately, since qualification depends on `CHECK` constraints that may
+   not be parsed yet at that point; `sqlite3EndTable()` resolves it once constraint resolution is
+   complete, into qualifies / near-miss error / silent fallback to an ordinary index, per §2's near
+   -miss policy including the `db->init.busy` carve-out. Verified against 26 concrete test-case
+   schemas under both a default and a `SQLITE_128BIT_ROWID` build. **Not yet implemented:** the
+   actual storage encoding and read/write codegen (steps 3–9 below) — a qualifying table's schema
+   is accepted, but `INSERT`/`SELECT` on its PK column still hits the unmodified INTEGER-only
+   codegen and fails gracefully (`datatype mismatch`), not a crash.
+   - `BLOB`/`TEXT` width is capped at 8 bytes in a default build and 16 bytes under
+     `SQLITE_128BIT_ROWID` — a default build's `rowid_t` is still a plain 64-bit integer, so only
+     `SQLITE_128BIT_ROWID` unlocks the full UUID-sized (16-byte) case. `REAL` (always exactly 8
+     bytes) is unaffected either way.
 3. **Value↔rowid conversion primitives (not started).** The `BLOB`/`TEXT`/`REAL`-to-`rowid_t`
    encoding and its inverse, including the bit-canonicalization transforms from §2, as standalone,
    unit-testable functions ahead of any VDBE integration.
