@@ -1025,6 +1025,143 @@ typedef INT16_TYPE i16;            /* 2-byte signed integer */
 typedef UINT8_TYPE u8;             /* 1-byte unsigned integer */
 typedef INT8_TYPE i8;              /* 1-byte signed integer */
 
+/*
+** Narrow-fixed-width-PK-as-rowid (README.md), Phase 3: value<->rowid_t
+** conversion primitives. NARROWPK_MAX_WIDTH is the widest BLOB/TEXT a
+** narrow-PK-as-rowid column can declare -- it's exactly rowid_t's own
+** byte width, since the whole point is embedding the value directly as
+** the rowid: 8 bytes (a plain i64) in a default build, 16 bytes (a full
+** sqlite3_uint128) under SQLITE_128BIT_ROWID.
+*/
+#define NARROWPK_MAX_WIDTH ((int)sizeof(rowid_t))
+
+/*
+** rowidFromNarrowBytes()/rowidToNarrowBytes(): BLOB/TEXT <-> rowid_t.
+** Embeds nByte raw bytes (1<=nByte<=NARROWPK_MAX_WIDTH) into the HIGH-
+** order bytes of a rowid_t, zero-padding any remaining low-order bytes,
+** with the top bit of the first (most-significant) byte flipped.
+**
+** The flip is needed because rowid_t comparison (rowidCompare()) is
+** SIGNED two's-complement, but BLOB/TEXT ordering must match UNSIGNED
+** memcmp order (0x00 < 0x7F < 0x80 < 0xFF, no sign flip at 0x80): with
+** no transform at all, a high-aligned embed's sign bit exactly tracks
+** the first byte's top bit, which inverts the two halves' relative
+** order under signed comparison (every 0x80-0xFF-leading value would
+** read as "negative", i.e. less than every 0x00-0x7F-leading value --
+** backwards from memcmp order). Flipping exactly that one bit swaps the
+** two halves into the correct signed bucket while leaving each half's
+** internal relative order untouched (a fixed single-bit XOR doesn't
+** change how the remaining bits of two same-original-top-bit values
+** compare to each other). This single-byte-0 flip is exactly equivalent
+** to flipping bit 63/127 of the whole rowid_t, since byte 0 occupies
+** the rowid_t's most significant byte -- flipping it before embedding
+** is simpler than manipulating the assembled rowid_t afterward.
+**
+** TEXT reuses these directly against its UTF-8 byte representation --
+** no separate TEXT-specific conversion exists (see README.md sections 2/3).
+*/
+#ifdef SQLITE_128BIT_ROWID
+static SQLITE_INLINE rowid_t rowidFromNarrowBytes(const u8 *aByte, int nByte){
+  sqlite3_uint128 v;
+  int i;
+  assert( nByte>=1 && nByte<=NARROWPK_MAX_WIDTH );
+  v = int128FromU64((u64)(u8)(aByte[0] ^ 0x80));
+  for(i=1; i<nByte; i++){
+    v = int128Add(int128ShiftLeft(v,8), int128FromU64(aByte[i]));
+  }
+  return int128ShiftLeft(v, (NARROWPK_MAX_WIDTH-nByte)*8);
+}
+static SQLITE_INLINE void rowidToNarrowBytes(rowid_t x, u8 *aOut, int nByte){
+  sqlite3_uint128 v;
+  int i;
+  assert( nByte>=1 && nByte<=NARROWPK_MAX_WIDTH );
+  v = int128ShiftRight(x, (NARROWPK_MAX_WIDTH-nByte)*8);
+  for(i=nByte-1; i>=1; i--){
+    aOut[i] = (u8)(int128ToU64(v) & 0xff);
+    v = int128ShiftRight(v, 8);
+  }
+  aOut[0] = (u8)(int128ToU64(v) & 0xff) ^ 0x80;
+}
+#else
+static SQLITE_INLINE rowid_t rowidFromNarrowBytes(const u8 *aByte, int nByte){
+  u64 v;
+  int i;
+  assert( nByte>=1 && nByte<=NARROWPK_MAX_WIDTH );
+  v = (u64)(u8)(aByte[0] ^ 0x80);
+  for(i=1; i<nByte; i++) v = (v<<8) | aByte[i];
+  v <<= (NARROWPK_MAX_WIDTH-nByte)*8;
+  return (rowid_t)(i64)v;
+}
+static SQLITE_INLINE void rowidToNarrowBytes(rowid_t x, u8 *aOut, int nByte){
+  u64 v = (u64)(i64)x;
+  int i;
+  assert( nByte>=1 && nByte<=NARROWPK_MAX_WIDTH );
+  v >>= (NARROWPK_MAX_WIDTH-nByte)*8;
+  for(i=nByte-1; i>=1; i--){
+    aOut[i] = (u8)(v & 0xff);
+    v >>= 8;
+  }
+  aOut[0] = (u8)(v & 0xff) ^ 0x80;
+}
+#endif
+
+/*
+** rowidFromReal()/rowidToReal(): REAL <-> rowid_t. Applies the standard
+** IEEE-754-bits-to-monotonic-orderable-int transform to the double's
+** raw 8-byte bit pattern, then embeds those 8 bytes high-aligned
+** (zero-padded low, same convention as rowidFromNarrowBytes() -- a
+** no-op in a default build, where NARROWPK_MAX_WIDTH is already 8).
+**
+** Unlike rowidFromNarrowBytes(), this is NOT a fixed single-bit flip --
+** derived and verified (via a standalone test program, not merely
+** assumed) against the actual target: rowidCompare() is SIGNED, so:
+**   - A non-negative double (r>=0.0) needs NO transform at all: raw
+**     IEEE-754 positive-double bit patterns already sort correctly as
+**     plain unsigned integers, their sign bit is already 0 (reads as
+**     non-negative/"large" under signed comparison, the correct
+**     bucket), and comparing two same-sign-bit values gives the same
+**     result under signed or unsigned interpretation.
+**   - A negative double (r<0.0) keeps its sign bit at 1 (already the
+**     correct "negative"/"small" bucket under signed comparison) but
+**     needs its lower 63 bits flipped: IEEE-754 encodes MORE negative
+**     numbers with LARGER magnitude bits, backwards from the order we
+**     want, and flipping those 63 bits (leaving the sign bit alone)
+**     exactly reverses their relative order without touching which
+**     bucket the value lands in.
+**   - +0.0 and -0.0 are explicitly canonicalized to the same rowid_t
+**     (checking the numeric value r==0.0, not the raw sign bit, is what
+**     makes this correct -- -0.0's raw bit pattern otherwise has its
+**     sign bit set despite being numerically non-negative, which would
+**     otherwise wrongly route it through the negative-number transform
+**     and land it far away from +0.0's canonical value).
+*/
+static SQLITE_INLINE rowid_t rowidFromReal(double r){
+  u64 u;
+  if( r==0.0 ){
+    u = 0;
+  }else{
+    memcpy(&u, &r, sizeof(u));
+    if( r<0.0 ) u ^= 0x7FFFFFFFFFFFFFFFULL;
+  }
+#ifdef SQLITE_128BIT_ROWID
+  return int128ShiftLeft(int128FromU64(u), (NARROWPK_MAX_WIDTH-8)*8);
+#else
+  return (rowid_t)(i64)u;
+#endif
+}
+static SQLITE_INLINE double rowidToReal(rowid_t x){
+  u64 u;
+  double r;
+#ifdef SQLITE_128BIT_ROWID
+  u = int128ToU64(int128ShiftRight(x, (NARROWPK_MAX_WIDTH-8)*8));
+#else
+  u = (u64)(i64)x;
+#endif
+  if( u & 0x8000000000000000ULL ) u ^= 0x7FFFFFFFFFFFFFFFULL;
+  memcpy(&r, &u, sizeof(r));
+  return r;
+}
+
 /* A bitfield type for use inside of structures.  Always follow with :N where
 ** N is the number of bits.
 */

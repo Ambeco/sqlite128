@@ -1829,17 +1829,9 @@ static void makeColumnPartOfPrimaryKey(Parse *pParse, Column *pCol){
 }
 
 /*
-** Narrow-fixed-width-PK-as-rowid (README.md) maximum BLOB/TEXT width.
-** rowid_t is only 128 bits (16 bytes) wide in a SQLITE_128BIT_ROWID
-** build (see sqliteInt128.h/Phase 1-4) -- in a default build it's still
-** a plain 64-bit i64, which can only ever hold up to 8 bytes. REAL is
-** unaffected (always exactly 8 bytes, fits either way).
+** NARROWPK_MAX_WIDTH is defined in sqliteInt.h, alongside the Phase 3
+** rowid_t<->value conversion primitives it's also used by.
 */
-#ifdef SQLITE_128BIT_ROWID
-# define NARROWPK_MAX_WIDTH 16
-#else
-# define NARROWPK_MAX_WIDTH 8
-#endif
 
 /*
 ** Narrow-fixed-width-PK-as-rowid (README.md). If pCol's declared type,
