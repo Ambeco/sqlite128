@@ -124,9 +124,11 @@ forward, with step 1 already done.
      `SQLITE_128BIT_ROWID` — a default build's `rowid_t` is still a plain 64-bit integer, so only
      `SQLITE_128BIT_ROWID` unlocks the full UUID-sized (16-byte) case. `REAL` (always exactly 8
      bytes) is unaffected either way.
-3. **Value↔rowid conversion primitives (not started).** The `BLOB`/`TEXT`/`REAL`-to-`rowid_t`
-   encoding and its inverse, including the bit-canonicalization transforms from §2, as standalone,
-   unit-testable functions ahead of any VDBE integration.
+3. **Value↔rowid conversion primitives (done).** `rowidFromNarrowBytes()`/`rowidToNarrowBytes()`
+   (`BLOB`/`TEXT`) and `rowidFromReal()`/`rowidToReal()` (`REAL`) in `sqliteInt.h`, implementing
+   §2's bit-canonicalization transforms. Verified standalone (round-trip and order-matches-memcmp/
+   numeric-order checks across widths, boundary values, and randomized pairs) before any VDBE
+   integration — not yet wired into `INSERT`/`SELECT`/`UPDATE` codegen (steps 4+).
 4. **INSERT codegen (not started).** Wire step 3's conversion into `insert.c` so a qualifying table
    actually gets compact table-b-tree storage on write.
 5. **SELECT read-back codegen (not started).** Reverse the step 3 transform wherever a rowid-aliased
