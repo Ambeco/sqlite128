@@ -6316,7 +6316,7 @@ case OP_RowData: {
   break;
 }
 
-/* Opcode: Rowid P1 P2 * * *
+/* Opcode: Rowid P1 P2 * P4 *
 ** Synopsis: r[P2]=PX rowid of P1
 **
 ** Store in register P2 an integer which is the key of the table entry that
@@ -6325,10 +6325,19 @@ case OP_RowData: {
 ** P1 can be either an ordinary table or a virtual table.  There used to
 ** be a separate OP_VRowid opcode for use with virtual tables, but this
 ** one opcode now works for both table types.
+**
+** Narrow-fixed-width-PK-as-rowid (README.md): if P4 is a Table pointer
+** (P4_TABLE) whose column at Table.iPKey qualifies as a BLOB/TEXT/REAL
+** rowid alias (one of TF_PKeyIsBlob/TF_PKeyIsText/TF_PKeyIsReal set), the
+** value stored in P2 is the reconstructed original column value in its
+** natural SQL type, not the raw rowid_t bits -- sqlite3ExprCodeGetColumnOfTable()
+** in expr.c is the only place that ever passes this P4; every other
+** OP_Rowid emission site needs the raw key for internal bookkeeping
+** (OP_SeekRowid, OP_Delete, comparisons) and correctly omits it.
 */
 case OP_Rowid: {                 /* out2, ncycle */
   VdbeCursor *pC;
-  i64 v;
+  rowid_t v;
   sqlite3_vtab *pVtab;
   const sqlite3_module *pModule;
 
@@ -6341,20 +6350,28 @@ case OP_Rowid: {                 /* out2, ncycle */
     pOut->flags = MEM_Null;
     break;
   }else if( pC->deferredMoveto ){
-    /* OP_Rowid's output register is a plain SQL integer (Mem.u.i), which
-    ** this fork is intentionally not widening past 64 bits -- see the
-    ** project notes on scope. rowidTruncateToI64() is the deliberate,
-    ** non-asserting narrowing for that boundary. */
-    v = rowidTruncateToI64(pC->movetoTarget);
+    /* pC->movetoTarget is already a full-width rowid_t -- no truncation
+    ** needed here (see the narrow-fixed-width-PK-as-rowid P4 handling
+    ** below, which is exactly why this case can no longer afford to
+    ** truncate before that runs). */
+    v = pC->movetoTarget;
 #ifndef SQLITE_OMIT_VIRTUALTABLE
   }else if( pC->eCurType==CURTYPE_VTAB ){
+    i64 vI64;
     assert( pC->uc.pVCur!=0 );
     pVtab = pC->uc.pVCur->pVtab;
     pModule = pVtab->pModule;
     assert( pModule->xRowid );
-    rc = pModule->xRowid(pC->uc.pVCur, &v);
+    rc = pModule->xRowid(pC->uc.pVCur, &vI64);
     sqlite3VtabImportErrmsg(p, pVtab);
     if( rc ) goto abort_due_to_error;
+    /* Virtual tables never participate in narrow-fixed-width-PK-as-rowid
+    ** (it's a real-table-b-tree-only feature) -- xRowid's i64 is always
+    ** the whole story, sign-extended the same way the classic INTEGER
+    ** PRIMARY KEY case already is. pOp->p4type is never P4_TABLE for a
+    ** vtab cursor's OP_Rowid, so the P4 check below is unreachable here,
+    ** but v must still be a real rowid_t for the final assignment. */
+    v = rowidFromI64(vI64);
 #endif /* SQLITE_OMIT_VIRTUALTABLE */
   }else{
     assert( pC->eCurType==CURTYPE_BTREE );
@@ -6365,9 +6382,28 @@ case OP_Rowid: {                 /* out2, ncycle */
       pOut->flags = MEM_Null;
       break;
     }
-    v = rowidTruncateToI64(sqlite3BtreeIntegerKey(pC->uc.pCursor));
+    /* sqlite3BtreeIntegerKey() already returns the full-width rowid_t
+    ** (same reasoning as the deferredMoveto case above). */
+    v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
   }
-  pOut->u.i = v;
+  /* Narrow-fixed-width-PK-as-rowid (README.md): sqlite3ExprCodeGetColumnOfTable()
+  ** (expr.c) is the only OP_Rowid emission site that ever sets P4 to a
+  ** Table -- every other site (internal row-identity bookkeeping for
+  ** OP_SeekRowid/OP_Delete/comparisons, not a user-visible column value)
+  ** omits it and gets today's plain-integer behavior unchanged below,
+  ** including the classic INTEGER PRIMARY KEY case (which never has
+  ** TF_PKeyIsBlob/Text/Real set, so reaches the plain-integer path too
+  ** even when P4 is present -- expr.c only sets it when one of those
+  ** flags is already confirmed set). */
+  if( pOp->p4type==P4_TABLE ){
+    sqlite3VdbeMemSetRowid(pOut, v, pOp->p4.pTab);
+  }else{
+    /* OP_Rowid's output register is a plain SQL integer (Mem.u.i), which
+    ** this fork is intentionally not widening past 64 bits -- see the
+    ** project notes on scope. rowidTruncateToI64() is the deliberate,
+    ** non-asserting narrowing for that boundary. */
+    pOut->u.i = rowidTruncateToI64(v);
+  }
   break;
 }
 

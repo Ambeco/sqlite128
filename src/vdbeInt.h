@@ -666,6 +666,7 @@ int sqlite3VdbeMemStringify(Mem*, u8, u8);
 int sqlite3IntFloatCompare(i64,double);
 i64 sqlite3VdbeIntValue(const Mem*);
 rowid_t sqlite3VdbeMemToRowid(const Mem*);
+void sqlite3VdbeMemSetRowid(Mem*, rowid_t, const Table*);
 int sqlite3VdbeMemIntegerify(Mem*);
 double sqlite3VdbeRealValue(Mem*);
 int sqlite3MemRealValueRC(Mem*, double*);

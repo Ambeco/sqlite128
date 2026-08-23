@@ -698,6 +698,40 @@ rowid_t sqlite3VdbeMemToRowid(const Mem *pKey){
 }
 
 /*
+** Narrow-fixed-width-PK-as-rowid (README.md): the reverse of
+** sqlite3VdbeMemToRowid() -- given a table b-tree key already read out as
+** a full-width rowid_t (OP_Rowid's job, see the OP_Rowid case in vdbe.c,
+** is to get one, never to hand back the raw bits for a qualifying table)
+** and the Table it came from, reconstruct the original column value into
+** pOut in its natural SQL type.
+**
+** Deliberately does NOT introduce any new Mem representation for "a raw
+** rowid_t" -- rowid stays a plain C local the whole time this function
+** runs, exactly mirroring sqlite3VdbeMemToRowid()'s Mem-to-rowid_t
+** direction. The BLOB/TEXT case's sqlite3VdbeMemSetStr() call is the
+** exact same allocation path an ordinary BLOB/TEXT column read already
+** takes -- nothing new or extra there, just the usual copy-into-pMem
+** given a byte buffer computed by rowidToNarrowBytes() on the stack.
+**
+** pTab must have one of TF_PKeyIsBlob/TF_PKeyIsText/TF_PKeyIsReal set
+** (i.e. this is only ever called for a qualifying rowid alias -- the
+** classic INTEGER PRIMARY KEY case, and every other OP_Rowid use in the
+** codebase, never reaches this function at all).
+*/
+void sqlite3VdbeMemSetRowid(Mem *pOut, rowid_t rowid, const Table *pTab){
+  u8 aBuf[NARROWPK_MAX_WIDTH];
+  assert( pTab!=0 );
+  assert( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) );
+  if( pTab->tabFlags & TF_PKeyIsReal ){
+    sqlite3VdbeMemSetDouble(pOut, rowidToReal(rowid));
+  }else{
+    rowidToNarrowBytes(rowid, aBuf, pTab->pKeyWidth);
+    sqlite3VdbeMemSetStr(pOut, (const char*)aBuf, pTab->pKeyWidth,
+        (pTab->tabFlags & TF_PKeyIsText) ? SQLITE_UTF8 : 0, SQLITE_TRANSIENT);
+  }
+}
+
+/*
 ** This routine implements the uncommon and slower path for
 ** sqlite3MemRealValueRC() that has to deal with input strings
 ** that are not UTF8 or that are not zero-terminated.  It is

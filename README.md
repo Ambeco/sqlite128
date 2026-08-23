@@ -145,10 +145,25 @@ forward, with step 1 already done.
    itself needed `sqlite3DeleteTable()` to free it on early-abort paths, or it leaked. **Known
    limitation, expected until step 5 lands:** `SELECT`ing the rowid-aliased column back currently
    returns garbage (raw rowid bits, untransformed) — write-only for now, by design of the roadmap.
-5. **SELECT read-back codegen (not started, next up).** Reverse the step 3 transform wherever a rowid-aliased
-   column is read back — likely the most spread-out step, since `INTEGER PRIMARY KEY` reads are
-   currently free (the rowid *is* the value) via several short-circuit sites that will need the new
-   kinds to additionally repackage the correct `BLOB`/`TEXT`/`REAL` `MEM` type.
+5. **SELECT read-back codegen (done).** The single chokepoint predicted by the original audit,
+   `expr.c`'s `sqlite3ExprCodeGetColumnOfTable()`, now emits `OP_Rowid` with a new P4 operand (the
+   `Table*`) when the column qualifies; `vdbe.c`'s `OP_Rowid` reverses the step 3 encoding via a new
+   `sqlite3VdbeMemSetRowid()` (the mirror of step 4's `sqlite3VdbeMemToRowid()`) instead of handing
+   back raw rowid bits. Every other `OP_Rowid` emission site (internal row-identity bookkeeping —
+   `update.c`, `where.c`, `window.c`, etc. — not a user-visible column read) omits the new P4 and is
+   unchanged. Verified with a 16-byte `BLOB` under `SQLITE_128BIT_ROWID` carrying high entropy in
+   both halves, confirming full 128-bit precision survives the read path, not just the low 64 bits.
+   **Known correctness gap found (not introduced) by this step, deliberately deferred to step 7:**
+   `rowidTruncateToI64()`, used unchanged at every *other* `OP_Rowid` site, extracts only the low 64
+   bits of `rowid_t` — but narrow-PK's encoding embeds data in the *high* bits, so that truncation
+   produces all zeros (not a graceful degradation) whenever one of those sites touches an actual
+   narrow-PK table's real key. This has been true since Phase 1-4 introduced the high-bit embedding;
+   it surfaced now because step 5 prompted the question, not because step 5 caused it. It matters
+   concretely for `update.c`'s old-rowid tracking (step 7, UPDATE codegen, below) — a general fix
+   needs `VdbeCursor` itself to know its table's narrow-PK kind/width (populated at cursor-open
+   time), not a per-call-site opt-in like step 5 uses; step 7 is the first place this becomes
+   reachable, so it's the natural place to fix it structurally rather than repeat step 5's
+   narrower pattern.
 6. **WHERE-clause/seek integration (not started).** Apply the step 3 transform to comparison values
    in the query planner's fast rowid-seek paths (`where.c`/`wherecode.c`).
 7. **UPDATE codegen (not started).** Analogous to step 4, for `UPDATE` statements touching the PK

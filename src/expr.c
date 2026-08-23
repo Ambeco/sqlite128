@@ -4473,7 +4473,21 @@ void sqlite3ExprCodeGetColumnOfTable(
   assert( pTab!=0 );
   assert( iCol!=XN_EXPR );
   if( iCol<0 || iCol==pTab->iPKey ){
-    sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+    /* Narrow-fixed-width-PK-as-rowid (README.md): for a qualifying
+    ** BLOB/TEXT/REAL rowid alias, OP_Rowid must reverse the step 3
+    ** encoding to reproduce the original column value, not hand back the
+    ** raw rowid_t bits -- pass pTab as P4 so OP_Rowid knows to do this
+    ** (see the OP_Rowid case in vdbe.c). Every other OP_Rowid call site
+    ** in the codebase (used for internal row-identity bookkeeping, not
+    ** for producing a user-visible column value) omits P4 and keeps
+    ** today's plain-integer behavior unchanged, including the classic
+    ** INTEGER PRIMARY KEY case here (TF_PKeyIsBlob/Text/Real is never set
+    ** for that case, so the P4 check below is a no-op for it too). */
+    if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+      sqlite3VdbeAddOp4(v, OP_Rowid, iTabCur, regOut, 0, (char*)pTab, P4_TABLE);
+    }else{
+      sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+    }
     VdbeComment((v, "%s.rowid", pTab->zName));
   }else{
     int op;
