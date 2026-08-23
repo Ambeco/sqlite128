@@ -2757,14 +2757,25 @@ struct Table {
   ** BLOB/TEXT/REAL kinds (1-16 for BLOB/TEXT, always 8 for REAL); 0 for the
   ** classic INTEGER case or when iPKey<0. Meaningful only when one of
   ** TF_PKeyIsBlob/TF_PKeyIsText/TF_PKeyIsReal is set in tabFlags.
-  ** iNarrowPKCandidate/narrowPKOnError are transient, parse-time-only
-  ** scratch fields carrying state from sqlite3AddPrimaryKey() to
-  ** sqlite3EndTable() within a single CREATE TABLE statement -- always -1/
-  ** reset by the time sqlite3EndTable() returns (same "transient field on
-  ** an otherwise-persistent Table" pattern as Table.u.tab.addColOffset). */
+  ** iNarrowPKCandidate/narrowPKOnError/pNarrowPKList are transient,
+  ** parse-time-only scratch fields carrying state from
+  ** sqlite3AddPrimaryKey() to sqlite3EndTable() within a single CREATE
+  ** TABLE statement -- always -1/0/NULL by the time sqlite3EndTable()
+  ** returns (same "transient field on an otherwise-persistent Table"
+  ** pattern as Table.u.tab.addColOffset). pNarrowPKList is the original,
+  ** parser-supplied single-column ExprList naming the candidate column
+  ** (e.g. from "PRIMARY KEY(b)") -- retained (rather than immediately
+  ** freed, as sqlite3AddPrimaryKey() does for every other case) because
+  ** its Expr/token carries real source-text position information that
+  ** ALTER TABLE RENAME COLUMN's token-tracking machinery depends on;
+  ** a synthetic ExprList built later from pCol->zCnName alone (which is
+  ** all narrowPKFinalize()'s fallback-index path has by then) has no such
+  ** position and silently defeats renaming for that column. See
+  ** narrowPKFinalize()'s use of it for the full explanation. */
   u8 pKeyWidth;
   i16 iNarrowPKCandidate;
   u8 narrowPKOnError;
+  ExprList *pNarrowPKList;
   union {
     struct {             /* Used by ordinary tables: */
       int addColOffset;    /* Offset in CREATE TABLE stmt to add a new column */

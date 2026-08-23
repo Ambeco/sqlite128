@@ -868,6 +868,16 @@ static void SQLITE_NOINLINE deleteTable(sqlite3 *db, Table *pTable){
   sqlite3DbFree(db, pTable->zName);
   sqlite3DbFree(db, pTable->zColAff);
   sqlite3ExprListDelete(db, pTable->pCheck);
+  /* Narrow-fixed-width-PK-as-rowid (README.md): pNarrowPKList is normally
+  ** consumed and freed by narrowPKFinalize() (called from sqlite3EndTable())
+  ** before this table is ever deleted. But a table can be discarded earlier
+  ** than that -- e.g. the STRICT-mode datatype check earlier in
+  ** sqlite3EndTable() returns before narrowPKFinalize() ever runs -- leaving
+  ** a still-pending candidate's retained ExprList (see the Table.
+  ** pNarrowPKList comment in sqliteInt.h) owned by nothing else. Free it
+  ** here too so that path doesn't leak it; harmless/a no-op once
+  ** narrowPKFinalize() has already run and reset this to NULL. */
+  sqlite3ExprListDelete(db, pTable->pNarrowPKList);
   sqlite3DbFree(db, pTable);
 
   /* Verify that no lookaside memory was used by schema tables */
@@ -1983,9 +1993,19 @@ void sqlite3AddPrimaryKey(
     ** source text) and aren't resolved to real column references until
     ** sqlite3ResolveSelfReference() runs in sqlite3EndTable(). Defer the
     ** whole qualify-vs-fallback-index decision to sqlite3EndTable(),
-    ** immediately after CHECK resolution -- see narrowPKFinalize(). */
+    ** immediately after CHECK resolution -- see narrowPKFinalize().
+    **
+    ** Retain pList (rather than letting it fall through to the unconditional
+    ** free at primary_key_exit, as every other branch here does) --
+    ** narrowPKFinalize()'s fallback-index path needs the ORIGINAL,
+    ** parser-supplied column-name Expr/token if it ends up not qualifying,
+    ** not a synthetic one built later from pCol->zCnName alone, or ALTER
+    ** TABLE RENAME COLUMN silently fails to find/rewrite this occurrence
+    ** (see the Table.pNarrowPKList comment in sqliteInt.h). */
     pTab->iNarrowPKCandidate = iCol;
     pTab->narrowPKOnError = (u8)onError;
+    pTab->pNarrowPKList = pList;
+    pList = 0;
   }else{
     sqlite3CreateIndex(pParse, 0, 0, 0, pList, onError, 0,
                            0, sortOrder, 0, SQLITE_IDXTYPE_PRIMARYKEY);
@@ -2840,6 +2860,15 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
   sqlite3 *db = pParse->db;
   int iCol = pTab->iNarrowPKCandidate;
   Column *pCol = &pTab->aCol[iCol];
+  /* Take ownership of the retained original PRIMARY KEY column-name
+  ** ExprList now, unconditionally -- every path out of this function must
+  ** either hand it to sqlite3CreateIndex() (the fallback-index path, which
+  ** needs its real source-text-positioned token -- see the Table.
+  ** pNarrowPKList comment in sqliteInt.h) or free it (every other path,
+  ** where it's simply not needed once the column becomes the rowid alias
+  ** or the candidate is rejected outright). */
+  ExprList *pPKList = pTab->pNarrowPKList;
+  pTab->pNarrowPKList = 0;
   int wType;                       /* width from the type specifier, or -1 */
   int kind = narrowPKTypeSpelling(pCol, &wType);
   const char *zRaw = sqlite3ColumnType(pCol, "");
@@ -2932,6 +2961,7 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
         zReason ? zReason : zReasonAlloc);
       sqlite3DbFree(db, zDeclared);
       sqlite3DbFree(db, zReasonAlloc);
+      sqlite3ExprListDelete(db, pPKList);
       return;
     }
     /* db->init.busy!=0: loading a pre-existing schema. Stay lenient --
@@ -2946,16 +2976,89 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
   pTab->tabFlags |= kind==COLTYPE_BLOB ? TF_PKeyIsBlob :
                      kind==COLTYPE_TEXT ? TF_PKeyIsText : TF_PKeyIsReal;
   pTab->pKeyWidth = kind==COLTYPE_REAL ? 8 : (u8)wCheck;
+  sqlite3ExprListDelete(db, pPKList);
   return;
 
 narrowpk_fallback_index: {
-    ExprList *pList;
+    ExprList *pList = pPKList;
     Token colToken;
-    sqlite3TokenInit(&colToken, pCol->zCnName);
-    pList = sqlite3ExprListAppend(pParse, 0,
-                sqlite3ExprAlloc(db, TK_ID, &colToken, 0));
+    int savedNErr;
+    int savedRc;
+    char *savedErrMsg;
+    /* pPKList is NULL for the INLINE single-column form ("col TYPE PRIMARY
+    ** KEY", where sqlite3AddPrimaryKey() is called with pList==0 -- there's
+    ** no separate column-name Expr to retain in that case, real or
+    ** otherwise). Passing NULL straight through to sqlite3CreateIndex()
+    ** would hit ITS OWN "pList==0" fallback, which assumes it's being
+    ** called immediately, synchronously, while iCol is still the LAST
+    ** column added to the table (true for mainline's immediate call from
+    ** sqlite3AddPrimaryKey(), false for us -- narrowPKFinalize() runs from
+    ** sqlite3EndTable(), well after every later column has already been
+    ** added). Build the synthetic single-column list here instead, using
+    ** the CORRECT column (pCol, from pTab->iNarrowPKCandidate) rather than
+    ** whichever column happens to be last -- getting this wrong doesn't
+    ** error, it just silently builds the fallback PRIMARY KEY index on the
+    ** wrong column. */
+    if( pList==0 ){
+      sqlite3TokenInit(&colToken, pCol->zCnName);
+      pList = sqlite3ExprListAppend(pParse, 0,
+                  sqlite3ExprAlloc(db, TK_ID, &colToken, 0));
+    }
+    /* Use the ORIGINAL, parser-supplied column-name ExprList retained by
+    ** sqlite3AddPrimaryKey() (see the Table.pNarrowPKList comment in
+    ** sqliteInt.h), not a freshly-synthesized one -- a synthetic Expr built
+    ** from pCol->zCnName alone (an earlier version of this code did exactly
+    ** that) has no real source-text position, so ALTER TABLE RENAME COLUMN's
+    ** token-tracking machinery can't find/rewrite this column's occurrence
+    ** inside "PRIMARY KEY(...)", silently leaving the old name behind and
+    ** corrupting the table's schema on rename. */
+    /* sqlite3CreateIndex() refuses to do anything if pParse->nErr is
+    ** already nonzero (its very first check). In mainline, the fallback
+    ** index for a non-INTEGER PRIMARY KEY is built immediately inside
+    ** sqlite3AddPrimaryKey(), at parse time, before any later error in
+    ** the same CREATE TABLE statement (e.g. a bad table option like
+    ** "WITHOUT _rowid_") can have incremented nErr. Narrow-PK-as-rowid
+    ** (README.md) necessarily defers this decision to sqlite3EndTable()
+    ** (see the big comment above narrowPKFinalize()), by which point
+    ** such an unrelated error may already have been raised -- so this
+    ** fallback must not inherit sqlite3CreateIndex()'s generic "abort on
+    ** any pending error" guard, or the index silently fails to get
+    ** built, leaving the table in a state that violates the invariant
+    ** asserted right after this function returns (TF_HasPrimaryKey set,
+    ** iPKey<0, no PRIMARY KEY index). Temporarily hide any pre-existing
+    ** error state -- nErr, rc, AND zErrMsg together -- so this call runs
+    ** as if it were the first thing this statement had done wrong, then
+    ** restore whatever was there before, preserving both the original
+    ** error and any new one from this call. All three must move together:
+    ** sqlite3ErrorMsg() always sets nErr/rc/zErrMsg as one atomic unit, so
+    ** restoring only nErr/rc (an earlier version of this fix) left a
+    ** leftover zErrMsg from the pre-existing error paired with rc reset to
+    ** SQLITE_OK by sqlite3CreateIndex()'s own successful-completion codegen
+    ** -- a combination sqlite3ErrorMsg() itself can never produce. That
+    ** mismatch was harmless for THIS call's own Parse object, but
+    ** sqlite3CreateIndex() internally runs a nested sqlite3RunParser() (via
+    ** sqlite3NestedParse(), to write the new index's sqlite_master row)
+    ** that reuses the SAME Parse object; that nested call's own
+    ** end-of-statement bookkeeping (in tokenize.c) checks
+    ** "zErrMsg || rc!=OK" using a LOCAL error counter distinct from
+    ** pParse->nErr, and doesn't know or care that this particular zErrMsg
+    ** is stale -- it saw rc==SQLITE_OK (correct, from its own successful
+    ** INSERT) alongside a non-NULL zErrMsg (wrong, leftover) and tripped
+    ** its own "nErr==0 || rc!=SQLITE_OK" consistency assert. */
+    savedNErr = pParse->nErr;
+    savedRc = pParse->rc;
+    savedErrMsg = pParse->zErrMsg;
+    pParse->nErr = 0;
+    pParse->zErrMsg = 0;
     sqlite3CreateIndex(pParse, 0, 0, 0, pList, pTab->narrowPKOnError, 0,
                            0, 0, 0, SQLITE_IDXTYPE_PRIMARYKEY);
+    pParse->nErr += savedNErr;
+    if( pParse->rc==SQLITE_OK ) pParse->rc = savedRc;
+    if( pParse->zErrMsg==0 ){
+      pParse->zErrMsg = savedErrMsg;
+    }else{
+      sqlite3DbFree(db, savedErrMsg);
+    }
   }
 }
 
