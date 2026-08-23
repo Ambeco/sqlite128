@@ -5635,7 +5635,7 @@ case OP_SeekRowid: {        /* jump0, in3, ncycle */
   VdbeCursor *pC;
   BtCursor *pCrsr;
   int res;
-  i64 iKey;
+  rowid_t iKey;
 
   pIn3 = &aMem[pOp->p3];
   testcase( pIn3->flags & MEM_Int );
@@ -5647,30 +5647,50 @@ case OP_SeekRowid: {        /* jump0, in3, ncycle */
     ** integer value of pIn3.  Jump to P2 if pIn3 cannot be converted
     ** into an integer without loss of information.  Take care to avoid
     ** changing the datatype of pIn3, however, as it is used by other
-    ** parts of the prepared statement. */
+    ** parts of the prepared statement.
+    **
+    ** This fallback is untouched by narrow-fixed-width-PK-as-rowid
+    ** (README.md) -- it exists to coerce a numeric-looking comparison
+    ** value (e.g. WHERE rowid='5') for the classic INTEGER-rowid seek
+    ** path. The query planner does not yet emit OP_SeekRowid for a
+    ** narrow-PK-as-rowid column at all (that's a later step), so a
+    ** BLOB/TEXT/REAL pIn3 reaching this branch cannot happen yet; when
+    ** that later step lands, it must decide how (or whether) a
+    ** comparison value should be coerced here for those column kinds,
+    ** the same way this branch already does for the INTEGER case. */
+    i64 iKeyI64;
     Mem x = pIn3[0];
     if( x.flags & MEM_Str ){
       applyNumericAffinity(&x, 1);
     }
     if( x.flags & MEM_Int ){
-      iKey = x.u.i;
+      iKeyI64 = x.u.i;
     }else
     if( (x.flags & MEM_Real)==0
      || x.u.r < -9223372036854775808.0
      || x.u.r > 9223372036854775807.0
-     || (double)(iKey = sqlite3RealToI64(x.u.r))!=x.u.r
+     || (double)(iKeyI64 = sqlite3RealToI64(x.u.r))!=x.u.r
     ){
       goto jump_to_p2;
     }
+    iKey = rowidFromI64(iKeyI64);
     goto notExistsWithKey;
   }
   /* Fall through into OP_NotExists */
   /* no break */ deliberate_fall_through
 case OP_NotExists:          /* jump, in3, ncycle */
   pIn3 = &aMem[pOp->p3];
-  assert( (pIn3->flags & MEM_Int)!=0 || pOp->opcode==OP_SeekRowid );
   assert( pOp->p1>=0 && pOp->p1<p->nCursor );
-  iKey = pIn3->u.i;
+  /* Narrow-fixed-width-PK-as-rowid (README.md): pIn3 may hold a
+  ** BLOB/TEXT/REAL value in its natural type here, not just a plain
+  ** MEM_Int -- sqlite3VdbeMemToRowid() dispatches on the actual flag
+  ** (and is a no-op behavior change for the classic INTEGER case,
+  ** which was already exactly "read pIn3->u.i" before this feature
+  ** existed). This is the path insert.c's PRIMARY KEY uniqueness
+  ** pre-check emits OP_NotExists through directly (not via
+  ** OP_SeekRowid's fallthrough above), so this is what makes narrow-PK
+  ** INSERT's own duplicate-key check work. */
+  iKey = sqlite3VdbeMemToRowid(pIn3);
 notExistsWithKey:
   pC = p->apCsr[pOp->p1];
   assert( pC!=0 );
@@ -5682,9 +5702,9 @@ notExistsWithKey:
   pCrsr = pC->uc.pCursor;
   assert( pCrsr!=0 );
   res = 0;
-  rc = sqlite3BtreeTableMoveto(pCrsr, rowidFromI64(iKey), 0, &res);
+  rc = sqlite3BtreeTableMoveto(pCrsr, iKey, 0, &res);
   assert( rc==SQLITE_OK || res==0 );
-  pC->movetoTarget = rowidFromI64(iKey);  /* Used by OP_Delete */
+  pC->movetoTarget = iKey;  /* Used by OP_Delete */
   pC->nullRow = 0;
   pC->cacheStatus = CACHE_STALE;
   pC->deferredMoveto = 0;
@@ -5921,10 +5941,12 @@ case OP_Insert: {
   sqlite3VdbeIncrWriteCounter(p, pC);
 
   pKey = &aMem[pOp->p3];
-  assert( pKey->flags & MEM_Int );
   assert( memIsValid(pKey) );
   REGISTER_TRACE(pOp->p3, pKey);
-  x.nKey = rowidFromI64(pKey->u.i);
+  /* Narrow-fixed-width-PK-as-rowid (README.md): the key register may
+  ** hold a BLOB/TEXT/REAL value in its natural type, not just a plain
+  ** MEM_Int -- sqlite3VdbeMemToRowid() dispatches on the actual flag. */
+  x.nKey = sqlite3VdbeMemToRowid(pKey);
 
   if( pOp->p4type==P4_TABLE && HAS_UPDATE_HOOK(db) ){
     assert( pC->iDb>=0 );

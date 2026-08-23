@@ -129,9 +129,23 @@ forward, with step 1 already done.
    §2's bit-canonicalization transforms. Verified standalone (round-trip and order-matches-memcmp/
    numeric-order checks across widths, boundary values, and randomized pairs) before any VDBE
    integration — not yet wired into `INSERT`/`SELECT`/`UPDATE` codegen (steps 4+).
-4. **INSERT codegen (not started).** Wire step 3's conversion into `insert.c` so a qualifying table
-   actually gets compact table-b-tree storage on write.
-5. **SELECT read-back codegen (not started).** Reverse the step 3 transform wherever a rowid-aliased
+4. **INSERT codegen (done).** Step 3's conversion is wired into `insert.c`/`vdbe.c`/`vdbemem.c` (via
+   the new `sqlite3VdbeMemToRowid()` dispatch), so a qualifying table now gets compact table-b-tree
+   storage on write. Fixed three real bugs surfaced while verifying this against the full regression
+   suite in `narrowPKFinalize()` (`build.c`) — all pre-existing in step 2, not introduced by step 4,
+   but only found now: (a) its fallback-index path inherited `sqlite3CreateIndex()`'s "abort if
+   `pParse->nErr` already nonzero" guard, silently skipping the fallback index whenever an unrelated
+   earlier error existed in the same `CREATE TABLE` statement, corrupting the table's rowid/PK
+   invariant; (b) that same fallback path built a synthetic, non-source-positioned token instead of
+   retaining the parser's original `PRIMARY KEY(col)` `ExprList` (now `Table.pNarrowPKList`), so
+   `ALTER TABLE ... RENAME COLUMN` silently failed to find/rewrite that occurrence; (c) passing
+   `NULL` through to `sqlite3CreateIndex()`'s own `pList==0` fallback (correct only when called
+   immediately, synchronously, as mainline does) built the index on the wrong column once our
+   deferred call ran after later columns had already been added — plus the `pNarrowPKList` retention
+   itself needed `sqlite3DeleteTable()` to free it on early-abort paths, or it leaked. **Known
+   limitation, expected until step 5 lands:** `SELECT`ing the rowid-aliased column back currently
+   returns garbage (raw rowid bits, untransformed) — write-only for now, by design of the roadmap.
+5. **SELECT read-back codegen (not started, next up).** Reverse the step 3 transform wherever a rowid-aliased
    column is read back — likely the most spread-out step, since `INTEGER PRIMARY KEY` reads are
    currently free (the rowid *is* the value) via several short-circuit sites that will need the new
    kinds to additionally repackage the correct `BLOB`/`TEXT`/`REAL` `MEM` type.

@@ -1510,6 +1510,17 @@ void sqlite3Insert(
       sqlite3VdbeAddOp2(v, OP_Null, 0, regIns);
     }
     if( ipkColumn>=0 ){
+      /* Narrow-fixed-width-PK-as-rowid (README.md): for a BLOB/TEXT/REAL
+      ** rowid-aliasing column, the value must be supplied explicitly by
+      ** the INSERT -- there is no auto-rowid generation (OP_NewRowid
+      ** always produces a plain integer, which would violate the
+      ** column's required CHECK/type constraints), and the value must
+      ** not be coerced to an integer via OP_MustBeInt. A NULL value is
+      ** left to flow through as-is; it will fail the NOT NULL
+      ** constraint during the ordinary constraint checks below (step 2
+      ** already requires NOT NULL for a table to qualify at all). */
+      int bClassicIntRowid = (pTab->tabFlags &
+          (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))==0;
       /* Compute the new rowid */
       if( useTempTable ){
         sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid);
@@ -1517,7 +1528,7 @@ void sqlite3Insert(
         /* Rowid already initialized at tag-20191021-001 */
       }else{
         Expr *pIpk = pList->a[ipkColumn].pExpr;
-        if( pIpk->op==TK_NULL && !IsVirtual(pTab) ){
+        if( pIpk->op==TK_NULL && !IsVirtual(pTab) && bClassicIntRowid ){
           sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
           appendFlag = 1;
         }else{
@@ -1527,7 +1538,7 @@ void sqlite3Insert(
       /* If the PRIMARY KEY expression is NULL, then use OP_NewRowid
       ** to generate a unique primary key value.
       */
-      if( !appendFlag ){
+      if( !appendFlag && bClassicIntRowid ){
         int addr1;
         if( !IsVirtual(pTab) ){
           addr1 = sqlite3VdbeAddOp1(v, OP_NotNull, regRowid); VdbeCoverage(v);

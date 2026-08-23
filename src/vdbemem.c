@@ -657,6 +657,47 @@ i64 sqlite3VdbeIntValue(const Mem *pMem){
 }
 
 /*
+** Narrow-fixed-width-PK-as-rowid (README.md): convert pKey -- a value
+** already sitting in a register in its natural type (MEM_Int/MEM_IntReal,
+** MEM_Real, or MEM_Blob/MEM_Str) -- into the rowid_t used as its table
+** b-tree key. This is the single dispatch point that opcodes consuming
+** "a rowid value already computed into a register" (OP_Insert,
+** OP_NotExists/OP_SeekRowid, and -- reused by fkey.c -- foreign-key
+** parent-key lookups and comparisons) go through, instead of assuming
+** the register is always a plain MEM_Int the way they did before this
+** feature existed.
+**
+** This is deliberately NOT a reintroduction of Phase 6's SQL-visible
+** 128-bit INTEGER machinery (MEM_Int128, reverted in full): the value
+** stays in its ordinary, natural Mem representation the entire time --
+** the caller already has a genuine MEM_Blob/MEM_Str/MEM_Real/MEM_Int
+** register from ordinary expression codegen (sqlite3ExprCode() et al.
+** need no changes at all for this feature). Only the consuming opcode,
+** at the point it actually needs the b-tree key form, calls this to do
+** the narrow-PK-as-rowid encoding (rowidFromNarrowBytes()/rowidFromReal()
+** -- Phase 3, sqliteInt.h) or ordinary sign-extension (rowidFromI64())
+** for the classic INTEGER case.
+**
+** pKey's blob/text length (pKey->n) is trusted as the correct width --
+** by the time a value reaches here, either it came from an INTEGER
+** column (irrelevant), or Phase 2's schema-time CHECK-constraint
+** validation already guarantees a narrow-PK-as-rowid column's value is
+** always exactly its declared width.
+*/
+rowid_t sqlite3VdbeMemToRowid(const Mem *pKey){
+  assert( pKey!=0 );
+  assert( memIsValid(pKey) );
+  if( pKey->flags & (MEM_Int|MEM_IntReal) ){
+    return rowidFromI64(pKey->u.i);
+  }else if( pKey->flags & MEM_Real ){
+    return rowidFromReal(pKey->u.r);
+  }else{
+    assert( pKey->flags & (MEM_Blob|MEM_Str) );
+    return rowidFromNarrowBytes((const u8*)pKey->z, pKey->n);
+  }
+}
+
+/*
 ** This routine implements the uncommon and slower path for
 ** sqlite3MemRealValueRC() that has to deal with input strings
 ** that are not UTF8 or that are not zero-terminated.  It is
