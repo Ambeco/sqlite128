@@ -4991,7 +4991,180 @@ case OP_SeekGT: {       /* jump0, in3, group, ncycle */
 
   pC->deferredMoveto = 0;
   pC->cacheStatus = CACHE_STALE;
-  if( pC->isTable ){
+  if( pOp->p4type==P4_TABLE ){
+    /* Narrow-fixed-width-PK-as-rowid (README.md): P4 is a Table only when
+    ** wherecode.c's Case 3 (WHERE_IPK range/inequality) compiled this seek
+    ** against a qualifying BLOB/TEXT/REAL rowid alias -- this is a
+    ** table-only feature (never index b-trees), so P4_TABLE implies
+    ** pC->isTable. pIn3 holds a genuine natural-typed comparison value
+    ** from ordinary expression codegen, same as Case 2's equality seek.
+    **
+    ** Because the step 3 encoding is specifically designed so that plain
+    ** signed rowid_t comparison reproduces the original value's natural
+    ** ordering, a range seek against a correctly-encoded boundary is
+    ** exact -- no integer-approximation dance like the classic-INTEGER
+    ** path below needs (that dance exists only because REAL doesn't map
+    ** onto INTEGER injectively; BLOB/TEXT/REAL's encoding has no such
+    ** gap for a same-kind, same-width comparison value).
+    **
+    ** Two things can still need special handling, both mirroring the
+    ** classic path's own "value isn't numeret" fallback, generalized:
+    **   1. pIn3 might not even be the right SQL type for this column
+    **      (e.g. a TEXT/BLOB literal against a REAL-keyed column, or a
+    **      numeric literal against a BLOB/TEXT-keyed one) -- such a value
+    **      can never equal (or fall among) any row, so classify it as
+    **      sorting before or after every possible value, per SQLite's
+    **      ordinary NULL < numeric < TEXT < BLOB type ordering, and seek
+    **      to the corresponding table extreme (or give up) exactly the
+    **      way the classic path already does for its own "not even a
+    **      real number" case -- generalized to also cover "sorts before
+    **      everything", which classic INTEGER never needed (nothing sorts
+    **      below a plain number except NULL).
+    **   2. A BLOB/TEXT comparison value whose length differs from the
+    **      schema's declared width (pTab->pKeyWidth) is still the right
+    **      type, but the fixed-width embedding can make it compare EQUAL
+    **      to a real stored value it should only be a byte-prefix of --
+    **      mainline BLOB/TEXT ordering compares up to the shorter length
+    **      and treats the shorter value as "less" on a tie, but a shorter
+    **      literal's embedding implicitly zero-fills the low bits it
+    **      doesn't occupy, so it ties (doesn't lose) against a real value
+    **      sharing that prefix with an all-zero remainder. Untie by
+    **      adjusting exactly one boundary operator based on the sign of
+    **      (comparison value's length - schema width), same shape as the
+    **      classic path's own real-doesn't-land-on-an-integer adjustment.
+    */
+    Table *pT4 = pOp->p4.pTab;
+    rowid_t iKeyRowid = rowidFromI64(0); /* Init silences a bogus "maybe
+                                          ** uninitialized" warning -- every
+                                          ** path that reads it below has
+                                          ** already set it for real. */
+    int lenCmp = 0;    /* sign(pIn3's length - pT4->pKeyWidth), BLOB/TEXT only */
+    int bConverts;     /* True if pIn3 yields a genuine comparison key */
+    int bLo = 0;        /* If !bConverts: true if pIn3 sorts before every
+                        ** possible value of this column, false if after */
+
+    assert( pC->isTable );
+    pIn3 = &aMem[pOp->p3];
+    if( pIn3->flags & MEM_Null ){
+      /* NULL never satisfies any comparison operator, regardless of
+      ** which end of the range this bound is for -- same as the classic
+      ** path's own unconditional NULL check just below. */
+      VdbeBranchTaken(1,2);
+      goto jump_to_p2;
+    }
+    bConverts = 1;
+    if( pT4->tabFlags & TF_PKeyIsReal ){
+      if( pIn3->flags & MEM_Real ){
+        iKeyRowid = rowidFromReal(pIn3->u.r);
+      }else if( pIn3->flags & (MEM_Int|MEM_IntReal) ){
+        iKeyRowid = rowidFromReal((double)pIn3->u.i);
+      }else{
+        /* TEXT/BLOB compared to a REAL-keyed column: numeric always
+        ** sorts before TEXT/BLOB. */
+        bConverts = 0;
+        bLo = 1;
+      }
+    }else if( pT4->tabFlags & TF_PKeyIsBlob ){
+      if( (pIn3->flags & MEM_Blob)==0 ){
+        /* Anything but a genuine BLOB compared to a BLOB-keyed column:
+        ** NUMERIC and TEXT both always sort before BLOB (SQLite's
+        ** ordinary NULL < numeric < TEXT < BLOB type ordering) -- a TEXT
+        ** comparison value is NOT "close enough" to try encoding as if it
+        ** were the BLOB's raw bytes, even though both use MEM_Str/MEM_Blob
+        ** storage internally; BLOB affinity never coerces TEXT (confirmed
+        ** against applyAffinity() during the original design), so no
+        ** stored value here was ever really TEXT either. */
+        bConverts = 0;
+        bLo = 1;
+      }else{
+        int n = pIn3->n;
+        const u8 *z = (const u8*)pIn3->z;
+        u8 zPad[1];
+        if( n==0 ){
+          /* A zero-length BLOB/TEXT has no bytes to embed; treat it as a
+          ** single synthetic 0x00 byte for the embedding computation --
+          ** 0x00 is the smallest possible real byte value, so this
+          ** already sorts correctly relative to any 1-byte value, and
+          ** lenCmp (computed from the TRUE, un-padded length below) still
+          ** correctly resolves the tie against a real column value that
+          ** happens to start with 0x00. */
+          zPad[0] = 0;
+          z = zPad;
+          n = 1;
+        }
+        iKeyRowid = rowidFromNarrowBytes(z,
+                        n>NARROWPK_MAX_WIDTH ? NARROWPK_MAX_WIDTH : n);
+        lenCmp = (pIn3->n<pT4->pKeyWidth) ? -1 :
+                 (pIn3->n>pT4->pKeyWidth) ? 1 : 0;
+      }
+    }else{
+      /* TF_PKeyIsText -- the only remaining possibility, these three
+      ** flags are mutually exclusive by construction. */
+      if( (pIn3->flags & MEM_Str)==0 ){
+        if( pIn3->flags & MEM_Blob ){
+          /* BLOB compared to a TEXT-keyed column: BLOB always sorts
+          ** after TEXT. */
+          bConverts = 0;
+          bLo = 0;
+        }else{
+          /* NUMERIC compared to a TEXT-keyed column: numeric always
+          ** sorts before TEXT. */
+          bConverts = 0;
+          bLo = 1;
+        }
+      }else{
+        int n = pIn3->n;
+        const u8 *z = (const u8*)pIn3->z;
+        u8 zPad[1];
+        if( n==0 ){
+          zPad[0] = 0;
+          z = zPad;
+          n = 1;
+        }
+        iKeyRowid = rowidFromNarrowBytes(z,
+                        n>NARROWPK_MAX_WIDTH ? NARROWPK_MAX_WIDTH : n);
+        lenCmp = (pIn3->n<pT4->pKeyWidth) ? -1 :
+                 (pIn3->n>pT4->pKeyWidth) ? 1 : 0;
+      }
+    }
+
+    if( bConverts ){
+      if( lenCmp<0 ){
+        if( (oc & 0x0001)==(OP_SeekGT & 0x0001) ) oc--;
+      }else if( lenCmp>0 ){
+        if( (oc & 0x0001)==(OP_SeekLT & 0x0001) ) oc++;
+      }
+      rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, iKeyRowid, 0, &res);
+      pC->movetoTarget = iKeyRowid;  /* Used by OP_Delete */
+      if( rc!=SQLITE_OK ){
+        goto abort_due_to_error;
+      }
+    }else if( bLo ){
+      /* pIn3 sorts before every possible value of this column: every row
+      ** satisfies >=/> (seek to the very first row); no row satisfies
+      ** </<= . */
+      if( oc>=OP_SeekGE ){
+        rc = sqlite3BtreeFirst(pC->uc.pCursor, &res);
+        if( rc!=SQLITE_OK ) goto abort_due_to_error;
+        goto seek_not_found;
+      }else{
+        VdbeBranchTaken(1,2);
+        goto jump_to_p2;
+      }
+    }else{
+      /* pIn3 sorts after every possible value of this column: no row
+      ** satisfies >=/> ; every row satisfies </<= (seek to the very last
+      ** row). Exactly mirrors the classic path's own fallback. */
+      if( oc>=OP_SeekGE ){
+        VdbeBranchTaken(1,2);
+        goto jump_to_p2;
+      }else{
+        rc = sqlite3BtreeLast(pC->uc.pCursor, &res);
+        if( rc!=SQLITE_OK ) goto abort_due_to_error;
+        goto seek_not_found;
+      }
+    }
+  }else if( pC->isTable ){
     u16 flags3, newType;
     /* The OPFLAG_SEEKEQ/BTREE_SEEK_EQ flag is only set on index cursors */
     assert( sqlite3BtreeCursorHasHint(pC->uc.pCursor, BTREE_SEEK_EQ)==0
@@ -5642,22 +5815,52 @@ case OP_SeekRowid: {        /* jump0, in3, ncycle */
   testcase( pIn3->flags & MEM_IntReal );
   testcase( pIn3->flags & MEM_Real );
   testcase( (pIn3->flags & (MEM_Str|MEM_Int))==MEM_Str );
+  /* Narrow-fixed-width-PK-as-rowid (README.md): P4 is a Table only when
+  ** wherecode.c's Case 2 (WHERE_IPK equality) compiled this seek against a
+  ** qualifying BLOB/TEXT/REAL rowid alias -- pIn3 then holds a genuine
+  ** natural-typed comparison value (from ordinary expression codegen, no
+  ** coercion applied), which the numeric-affinity fallback just below
+  ** must never touch: applying numeric affinity to a real BLOB comparison
+  ** value is meaningless, and treating a type/width mismatch as "give up,
+  ** not found" here (rather than falling into that fallback's classic-
+  ** integer-only logic) is exactly right, since a mismatched type or a
+  ** wrong-length BLOB/TEXT literal can never equal any stored row (CHECK
+  ** constraints enforce the exact declared width on every stored value).
+  ** Every other OP_SeekRowid call site omits P4 and reaches the unchanged
+  ** classic-integer fallback below exactly as before. */
+  if( pOp->p4type==P4_TABLE ){
+    Table *pT4 = pOp->p4.pTab;
+    if( pT4->tabFlags & TF_PKeyIsReal ){
+      double r;
+      if( pIn3->flags & MEM_Real ){
+        r = pIn3->u.r;
+      }else if( pIn3->flags & (MEM_Int|MEM_IntReal) ){
+        r = (double)pIn3->u.i;
+      }else{
+        goto jump_to_p2;
+      }
+      iKey = rowidFromReal(r);
+    }else{
+      /* Require the SPECIFIC flag matching this column's declared kind,
+      ** not just "blob or string" -- a TEXT comparison value can never
+      ** equal a BLOB-keyed column's value (or vice versa) regardless of
+      ** byte content, per SQLite's ordinary type-ordering rules (and
+      ** BLOB affinity never coerces TEXT, so no stored BLOB-keyed value
+      ** was ever really TEXT either). */
+      u16 wantFlag = (pT4->tabFlags & TF_PKeyIsBlob) ? MEM_Blob : MEM_Str;
+      if( (pIn3->flags & wantFlag)==0 || pIn3->n!=pT4->pKeyWidth ){
+        goto jump_to_p2;
+      }
+      iKey = rowidFromNarrowBytes((const u8*)pIn3->z, pIn3->n);
+    }
+    goto notExistsWithKey;
+  }
   if( (pIn3->flags & (MEM_Int|MEM_IntReal))==0 ){
     /* If pIn3->u.i does not contain an integer, compute iKey as the
     ** integer value of pIn3.  Jump to P2 if pIn3 cannot be converted
     ** into an integer without loss of information.  Take care to avoid
     ** changing the datatype of pIn3, however, as it is used by other
-    ** parts of the prepared statement.
-    **
-    ** This fallback is untouched by narrow-fixed-width-PK-as-rowid
-    ** (README.md) -- it exists to coerce a numeric-looking comparison
-    ** value (e.g. WHERE rowid='5') for the classic INTEGER-rowid seek
-    ** path. The query planner does not yet emit OP_SeekRowid for a
-    ** narrow-PK-as-rowid column at all (that's a later step), so a
-    ** BLOB/TEXT/REAL pIn3 reaching this branch cannot happen yet; when
-    ** that later step lands, it must decide how (or whether) a
-    ** comparison value should be coerced here for those column kinds,
-    ** the same way this branch already does for the INTEGER case. */
+    ** parts of the prepared statement. */
     i64 iKeyI64;
     Mem x = pIn3[0];
     if( x.flags & MEM_Str ){

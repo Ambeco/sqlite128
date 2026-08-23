@@ -1707,6 +1707,8 @@ Bitmask sqlite3WhereCodeOneLoopStart(
     **          we reference multiple rows using a "rowid IN (...)"
     **          construct.
     */
+    Table *pIpkTab;
+
     assert( pLoop->u.btree.nEq==1 );
     pTerm = pLoop->aLTerm[0];
     assert( pTerm!=0 );
@@ -1716,15 +1718,29 @@ Bitmask sqlite3WhereCodeOneLoopStart(
     iRowidReg = codeEqualityTerm(pParse, pTerm, pLevel, 0, bRev, iReleaseReg);
     if( iRowidReg!=iReleaseReg ) sqlite3ReleaseTempReg(pParse, iReleaseReg);
     addrNxt = pLevel->addrNxt;
+    pIpkTab = pTabItem->pSTab;
+    /* Narrow-fixed-width-PK-as-rowid (README.md): iRowidReg holds a
+    ** genuine BLOB/TEXT/REAL comparison value for a qualifying rowid
+    ** alias, not necessarily (or ever) something OP_MustBeInt should be
+    ** applied to -- skip it for that case, same condition OP_SeekRowid
+    ** below uses to know whether to reverse the narrow-PK encoding
+    ** instead of assuming a plain integer. */
     if( pLevel->regFilter ){
-      sqlite3VdbeAddOp2(v, OP_MustBeInt, iRowidReg, addrNxt);
-      VdbeCoverage(v);
+      if( (pIpkTab->tabFlags&(TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))==0 ){
+        sqlite3VdbeAddOp2(v, OP_MustBeInt, iRowidReg, addrNxt);
+        VdbeCoverage(v);
+      }
       sqlite3VdbeAddOp4Int(v, OP_Filter, pLevel->regFilter, addrNxt,
                            iRowidReg, 1);
       VdbeCoverage(v);
       filterPullDown(pParse, pWInfo, iLevel, addrNxt, notReady);
     }
-    sqlite3VdbeAddOp3(v, OP_SeekRowid, iCur, addrNxt, iRowidReg);
+    if( pIpkTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+      sqlite3VdbeAddOp4(v, OP_SeekRowid, iCur, addrNxt, iRowidReg,
+                         (char*)pIpkTab, P4_TABLE);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_SeekRowid, iCur, addrNxt, iRowidReg);
+    }
     VdbeCoverage(v);
     pLevel->op = OP_Noop;
   }else if( (pLoop->wsFlags & WHERE_IPK)!=0
@@ -1788,7 +1804,18 @@ Bitmask sqlite3WhereCodeOneLoopStart(
         disableTerm(pLevel, pStart);
         op = aMoveOp[(pX->op - TK_GT)];
       }
-      sqlite3VdbeAddOp3(v, op, iCur, addrBrk, r1);
+      /* Narrow-fixed-width-PK-as-rowid (README.md): r1 holds a genuine
+      ** natural-typed comparison value for a qualifying rowid alias, same
+      ** as Case 2's equality seek -- pass P4=Table so OP_SeekGT/GE/LT/LE
+      ** know to encode it via the step 3 transform (ordering-preserving
+      ** by construction) instead of the classic-integer-only fallback. */
+      if( pTabItem->pSTab->tabFlags
+            & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        sqlite3VdbeAddOp4(v, op, iCur, addrBrk, r1,
+                           (char*)pTabItem->pSTab, P4_TABLE);
+      }else{
+        sqlite3VdbeAddOp3(v, op, iCur, addrBrk, r1);
+      }
       VdbeComment((v, "pk"));
       VdbeCoverageIf(v, pX->op==TK_GT);
       VdbeCoverageIf(v, pX->op==TK_LE);
@@ -1826,14 +1853,36 @@ Bitmask sqlite3WhereCodeOneLoopStart(
     pLevel->p2 = start;
     assert( pLevel->p5==0 );
     if( testOp!=OP_Noop ){
+      int bNarrowIpk = (pTabItem->pSTab->tabFlags
+            & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0;
       iRowidReg = ++pParse->nMem;
-      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, iRowidReg);
+      /* Narrow-fixed-width-PK-as-rowid (README.md): same P4=Table
+      ** treatment as every other OP_Rowid emission that needs the actual
+      ** column value rather than raw rowid bits (see expr.c's step 5
+      ** chokepoint) -- this one reads the CURRENT row during the scan to
+      ** compare against the end-of-range boundary, so it needs the same
+      ** reversal or the comparison below is meaningless for a qualifying
+      ** table. */
+      if( bNarrowIpk ){
+        sqlite3VdbeAddOp4(v, OP_Rowid, iCur, iRowidReg, 0,
+                           (char*)pTabItem->pSTab, P4_TABLE);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Rowid, iCur, iRowidReg);
+      }
       sqlite3VdbeAddOp3(v, testOp, memEndValue, addrBrk, iRowidReg);
       VdbeCoverageIf(v, testOp==OP_Le);
       VdbeCoverageIf(v, testOp==OP_Lt);
       VdbeCoverageIf(v, testOp==OP_Ge);
       VdbeCoverageIf(v, testOp==OP_Gt);
-      sqlite3VdbeChangeP5(v, SQLITE_AFF_NUMERIC | SQLITE_JUMPIFNULL);
+      /* SQLITE_AFF_NUMERIC would force numeric coercion on both operands,
+      ** meaningless (and potentially wrong, if a narrow-PK TEXT value
+      ** happens to look numeric) for a qualifying rowid alias -- use
+      ** SQLITE_AFF_BLOB (the one affinity that never coerces anything,
+      ** confirmed against applyAffinity()) instead, letting SQLite's
+      ** ordinary cross-type ordering rules (NULL < numeric < TEXT < BLOB)
+      ** apply directly to both already-natural-typed operands. */
+      sqlite3VdbeChangeP5(v, (bNarrowIpk ? SQLITE_AFF_BLOB : SQLITE_AFF_NUMERIC)
+                              | SQLITE_JUMPIFNULL);
     }
   }else if( pLoop->wsFlags & WHERE_INDEXED ){
     /* Case 4: Search using an index.

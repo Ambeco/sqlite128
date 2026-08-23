@@ -164,8 +164,34 @@ forward, with step 1 already done.
    time), not a per-call-site opt-in like step 5 uses; step 7 is the first place this becomes
    reachable, so it's the natural place to fix it structurally rather than repeat step 5's
    narrower pattern.
-6. **WHERE-clause/seek integration (not started).** Apply the step 3 transform to comparison values
-   in the query planner's fast rowid-seek paths (`where.c`/`wherecode.c`).
+6. **WHERE-clause/seek integration (done).** `wherecode.c`'s equality (`WHERE_IPK`) and range
+   (`OP_SeekGT`/`GE`/`LT`/`LE` start bound, `OP_Rowid`-based end bound) codegen now emits the same
+   `P4_TABLE`-gated opcodes as step 5 whenever the seeked column qualifies; `vdbe.c`'s
+   `OP_SeekRowid` and `OP_SeekGT`/`GE`/`LT`/`LE` reverse the step 3 encoding via `rowidFromReal()`/
+   `rowidFromNarrowBytes()` when they see that P4 kind, falling back to the untouched classic
+   integer path otherwise. Cross-type comparisons (a numeric or wrong-kind literal compared against
+   a `BLOB`/`TEXT`/`REAL`-keyed column) fall back on SQLite's existing type-ordering rules
+   (`NULL < numeric < TEXT < BLOB`) rather than attempting a conversion: a value that can't convert
+   to the column's declared kind is treated as sorting before or after every possible value of that
+   column, exactly mirroring how the classic `OP_SeekGT`-family already treats a `REAL` literal that
+   doesn't exactly convert to the `INTEGER` PK's domain. Wrong-*width* `BLOB`/`TEXT` literals (e.g.
+   `WHERE blobcol > x'01'` against a `BLOB(8)` column) are handled by embedding the literal at its
+   own length (bit-identical to zero-padding it to the column's width first) and then bumping the
+   boundary operator by one step (`>` becomes `>=`, `<` becomes `<=`, or vice versa) exactly as if
+   the embedding had produced an exact tie — because it does, and mainland `BLOB` `memcmp`-with-
+   length semantics say the shorter value is the lesser one whenever a real prefix match ties out.
+   Verified with equality/range probes (`=`, `<`, `<=`, `>`, `>=`) against `BLOB`/`TEXT`-keyed tables,
+   including wrong-width literals and cross-type literals in both directions (numeric vs. `BLOB`-
+   keyed, `TEXT` vs. `BLOB`-keyed and back), plus the full regression suite under both a default and
+   a `SQLITE_128BIT_ROWID` build. **Not a regression, but a pre-existing 128-bit-rowid-foundation gap
+   surfaced during this step's verification (out of scope for step 6, unrelated to narrow-PK):**
+   several `test/boundary*.test`, `ext/fts5/test/fts5contentless2.test`/`fts5origintext4.test`,
+   `test/amatch1.test`, and `test/altercorrupt.test` fail under `SQLITE_128BIT_ROWID` regardless of
+   whether step 6's (or even step 4/5's) changes are present — confirmed by reverting to the step 5
+   commit and reproducing the identical failures. These exercise huge plain-`INTEGER` rowid values,
+   FTS5's internal rowid bookkeeping, and corruption-recovery paths, none of which involve a
+   narrow-PK table; they're a gap in the wide-rowid foundation (step 1) itself, not something this
+   feature introduced.
 7. **UPDATE codegen (not started).** Analogous to step 4, for `UPDATE` statements touching the PK
    column.
 8. **Foreign-key verification (not started).** Confirm `fkey.c` correctly handles a parent table
