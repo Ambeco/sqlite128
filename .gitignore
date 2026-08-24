@@ -1,0 +1,92 @@
+################################################################################
+# This .gitignore file was originally auto-created by Microsoft(R) Visual
+# Studio, then hand-appended many times (with duplication) as new generated
+# files were noticed. Cleaned up and de-duplicated 2026-08-24: individual
+# file listings replaced with globs where safe to do so -- verified against
+# `git ls-files` that no glob below matches any currently tracked file.
+################################################################################
+
+/.vs
+/.target_source
+/ai instructions.txt
+
+################################################################################
+# Build-generated sources. Makefile.msc/nmake regenerates every one of these
+# at the repo root on every build (lemon-generated parser, keyword hash
+# table, the sqlite3.c/.h amalgamation, the fts5 amalgamation, etc.) -- never
+# hand-edit these; edit the corresponding file under src/ or ext/ instead.
+################################################################################
+/tsrc/
+/sqlite3.c
+/sqlite3.h
+/sqlite3ext.h
+/sqlite3rc.h
+/sqlite3session.h
+/shell.c
+/tclsqlite-ex.c
+/ctime.c
+/pragma.h
+/opcodes.c
+/opcodes.h
+/parse.c
+/parse.h
+/parse.y
+/parse.sql
+/parse.out
+/lempar.c
+/keywordhash.h
+/fts5.c
+/fts5.h
+/fts5parse.c
+/fts5parse.h
+/fts5parse.y
+/fts5parse.sql
+/fts5parse.out
+
+################################################################################
+# Build tools compiled from source as part of the build
+################################################################################
+/lemon.exe
+/mkkeywordhash.exe
+/mksourceid.exe
+/jimsh0.exe
+/src-verify.exe
+
+################################################################################
+# Compiled objects / debug info / import libs, wherever they land
+################################################################################
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lo
+
+################################################################################
+# Build outputs (testfixture, sqlite3.exe/.dll/.lib, fuzzcheck, etc.)
+################################################################################
+/testfixture.exe
+/testfixture.lib
+/sqlite3.def
+/sqlite3.exe
+/sqlite3.dll
+/sqlite3.lib
+/sqlite3sh.pdb
+/libsqlite3.lib
+/fuzzcheck.exe
+/fuzzcheck.lib
+/vc140.pdb
+
+################################################################################
+# Runtime scratch/output from test runs
+################################################################################
+/testdir/
+/*.log
+/*.db
+/*.db-journal
+/*.db-wal
+/*.db-shm
+/*.db2
+/quicktest_pid.txt
+/testrunner.db
+/testrunner.db-shm
+/testrunner.db-wal
