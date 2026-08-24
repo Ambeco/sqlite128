@@ -6249,7 +6249,18 @@ case OP_RowCell: {
   assert( pOp[1].p5 & OPFLAG_PREFORMAT );
   pDest = p->apCsr[pOp->p1];
   pSrc = p->apCsr[pOp->p2];
-  iKey = pOp->p3 ? rowidFromI64(aMem[pOp->p3].u.i) : rowidFromI64(0);
+  /* Narrow-fixed-width-PK-as-rowid (README.md): P3, when set, is a
+  ** register holding the rowid to use for the transferred row. For a
+  ** narrow-PK table that register holds the value in its natural
+  ** BLOB/TEXT/REAL type (an OP_Rowid+P4_TABLE upstream put it there --
+  ** see xferOptimization() in insert.c), not a plain integer, so it must
+  ** go through the same sqlite3VdbeMemToRowid() dispatch OP_Insert and
+  ** OP_NotExists already use rather than reading aMem[].u.i directly;
+  ** for the classic INTEGER PRIMARY KEY / plain rowid-table case (the
+  ** overwhelming majority of uses) the register holds a plain MEM_Int
+  ** and this dispatches straight through to the previous rowidFromI64()
+  ** behavior, unchanged. */
+  iKey = pOp->p3 ? sqlite3VdbeMemToRowid(&aMem[pOp->p3]) : rowidFromI64(0);
   rc = sqlite3BtreeTransferRow(pDest->uc.pCursor, pSrc->uc.pCursor, iKey);
   if( rc!=SQLITE_OK ) goto abort_due_to_error;
   break;

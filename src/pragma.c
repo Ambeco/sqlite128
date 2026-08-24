@@ -1634,7 +1634,19 @@ void sqlite3Pragma(
 
         /* Generate code to report an FK violation to the caller. */
         if( HasRowid(pTab) ){
-          sqlite3VdbeAddOp2(v, OP_Rowid, 0, regResult+1);
+          /* Narrow-fixed-width-PK-as-rowid (README.md): this value is
+          ** reported straight back to the caller as a query result (the
+          ** violating row's rowid/PK), not used as a b-tree key -- decode
+          ** it into pTab's natural column type via P4_TABLE so a
+          ** BLOB/TEXT/REAL rowid alias is reported as its real value
+          ** instead of raw rowid_t bits. See the OP_Rowid case in
+          ** vdbe.c. */
+          if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+            sqlite3VdbeAddOp4(v, OP_Rowid, 0, regResult+1,
+                               0, (char*)pTab, P4_TABLE);
+          }else{
+            sqlite3VdbeAddOp2(v, OP_Rowid, 0, regResult+1);
+          }
         }else{
           sqlite3VdbeAddOp2(v, OP_Null, 0, regResult+1);
         }

@@ -3388,7 +3388,21 @@ static int xferOptimization(
     sqlite3OpenTable(pParse, iSrc, iDbSrc, pSrc, OP_OpenRead);
     emptySrcTest = sqlite3VdbeAddOp2(v, OP_Rewind, iSrc, 0); VdbeCoverage(v);
     if( pDest->iPKey>=0 ){
-      addr1 = sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      /* Narrow-fixed-width-PK-as-rowid (README.md): for a qualifying
+      ** BLOB/TEXT/REAL rowid alias, OP_Rowid must decode the raw rowid_t
+      ** bits back into pSrc's natural column type (not hand them back
+      ** unchanged) so that regRowid is something OP_RowCell/OP_Insert can
+      ** correctly re-encode downstream -- see the OP_Rowid case in
+      ** vdbe.c. pSrc and pDest are guaranteed to agree on PK kind/width
+      ** here (xferOptimization() already required matching iPKey and
+      ** column affinity above), so either table's flags would do; pSrc
+      ** is used since it's the cursor OP_Rowid actually reads (P1=iSrc). */
+      if( pSrc->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        addr1 = sqlite3VdbeAddOp4(v, OP_Rowid, iSrc, regRowid,
+                                   0, (char*)pSrc, P4_TABLE);
+      }else{
+        addr1 = sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      }
       if( (db->mDbFlags & DBFLAG_Vacuum)==0 ){
         sqlite3VdbeVerifyAbortable(v, onError);
         addr2 = sqlite3VdbeAddOp3(v, OP_NotExists, iDest, 0, regRowid);

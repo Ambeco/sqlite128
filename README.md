@@ -330,6 +330,15 @@ forward, with step 1 already done.
       format-version gating is needed: a >8-byte narrow-PK table can only already exist in a file
       with the wide-rowid magic header set (per step 2's own width-cap validation), so type 11's
       usage automatically inherits that existing gate.
+11. **Fix the two confirmed §5a bugs found by the dedicated `SQLITE_128BIT_ROWID` audit — done.**
+    `VACUUM`/`INSERT ... SELECT` (via `insert.c`'s `xferOptimization()`, including `vdbe.c`'s
+    `OP_RowCell` opcode it relies on) and `ALTER TABLE ... DROP COLUMN` (`alter.c`'s row-rewrite)
+    both silently corrupted narrow-PK primary keys; `PRAGMA foreign_key_check` (`pragma.c`) also
+    misreported the violating row's identifier for a narrow-PK child table. All three fixed with the
+    same `P4_TABLE`-tagging pattern used throughout this project; full technical writeup in §5a.
+    Deliberately scoped separately from the numbered narrow-PK design steps above (these are bug
+    fixes to already-built functionality, not new functionality), but numbered here to keep the
+    step-by-step history complete and in order.
 
 ## 4. Potential follow-up work
 
@@ -359,42 +368,57 @@ forward, with step 1 already done.
 Confirmed, reproducible bugs under `SQLITE_128BIT_ROWID`, found via a dedicated audit pass (not
 part of the numbered step-by-step plan in §3, and not speculative follow-up work like §4 — these are
 concrete, verified defects). Kept separate and explicit so they aren't lost track of. None of these
-affect a default (non-`SQLITE_128BIT_ROWID`) build.
+affect a default (non-`SQLITE_128BIT_ROWID`) build. §5a (this fork's own narrow-PK bugs) is now fully
+fixed; §5b (pre-existing foundation bugs, unrelated to narrow-PK) remains open.
 
-### 5a. Narrow-PK feature bugs (this fork's own code)
+### 5a. Narrow-PK feature bugs (this fork's own code) — all fixed (step 11)
 
 Step 5 flagged that `rowidTruncateToI64()` — used, unchanged, at every `OP_Rowid` call site that
 doesn't carry the `P4_TABLE` tag — takes the LOW 64 bits of a `rowid_t`, which is the wrong half for
 a narrow-PK table's HIGH-aligned embedding (see `rowidFromNarrowBytes()`'s doc comment). Steps 6–10a
 fixed every such site actually reachable by ordinary `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`UPSERT`
-statement execution. This audit (2026-08-24) went through every remaining `OP_Rowid` emission site in
-the codebase (grep for `OP_Rowid,` across `src/*.c`, cross-checked against what's already `P4_TABLE`-
-tagged) and empirically tested each one still in doubt. Two are confirmed broken, both in table-
-maintenance code paths outside ordinary DML:
+statement execution. A dedicated audit (2026-08-24) went through every remaining `OP_Rowid` emission
+site in the codebase (grep for `OP_Rowid,` across `src/*.c`, cross-checked against what's already
+`P4_TABLE`-tagged) and empirically tested each one still in doubt, finding three confirmed bugs, all
+in table-maintenance code paths outside ordinary DML. All three were fixed immediately afterward
+(step 11, 2026-08-24):
 
-- **`VACUUM` silently corrupts every row of a narrow-PK table.** `vacuum.c` rebuilds each table via
-  `insert.c`'s `xferOptimization()` fast-copy path, which reads the source table's rowid with a bare
-  `OP_Rowid` (`insert.c`, `pDest->iPKey>=0` branch) and uses it directly as the new row's key. For a
-  narrow-PK table under `SQLITE_128BIT_ROWID`, the low 64 bits this reads are *always zero*
-  (the real bytes live entirely in the high half), so every row collapses onto the same rowid —
-  reproduced directly: a 3-row `BLOB(8)` PK table, after `VACUUM`, has all three rows reporting the
+- **`VACUUM` silently corrupted every row of a narrow-PK table.** `vacuum.c` rebuilds each table via
+  `insert.c`'s `xferOptimization()` fast-copy path, which read the source table's rowid with a bare
+  `OP_Rowid` (`insert.c`, `pDest->iPKey>=0` branch) and used it directly as the new row's key. For a
+  narrow-PK table under `SQLITE_128BIT_ROWID`, the low 64 bits this read were *always zero*
+  (the real bytes live entirely in the high half), so every row collapsed onto the same rowid —
+  reproduced directly: a 3-row `BLOB(8)` PK table, after `VACUUM`, had all three rows reporting the
   identical (wrong) key. The same `xferOptimization()` path is also used by plain
   `INSERT INTO dst SELECT * FROM src` between two identically-shaped tables — reproduced there too,
-  as a `UNIQUE constraint failed` (the collapsed keys collide) rather than silent data loss, but the
-  underlying defect is identical.
-- **`ALTER TABLE ... DROP COLUMN` corrupts narrow-PK values while rewriting the table.** The
-  drop-column row-rewrite in `alter.c` reads each row's rowid with a bare `OP_Rowid` and re-inserts
+  as a `UNIQUE constraint failed` (the collapsed keys collide) rather than silent data loss, same
+  underlying defect. **Fix:** tag that `OP_Rowid` with `P4_TABLE` (keyed off `pSrc`, the cursor it
+  actually reads — `xferOptimization()`'s own eligibility checks already guarantee `pSrc` and `pDest`
+  agree on PK column, affinity, and width) so it decodes into `pSrc`'s natural column type instead of
+  handing back raw `rowid_t` bits. That alone wasn't sufficient for `VACUUM`'s specific fast path,
+  though: `VACUUM` (and any xfer where `SQLITE_ENABLE_PREUPDATE_HOOK` is off) routes the row through
+  `OP_RowCell`, a second, independent opcode that read the rowid register as a raw `aMem[].u.i`
+  integer rather than going through the same `sqlite3VdbeMemToRowid()` dispatch `OP_Insert` and
+  `OP_NotExists` already use — silently discarding the natural-typed value the fixed `OP_Rowid` had
+  just produced. Fixed by switching `OP_RowCell` (`vdbe.c`) to `sqlite3VdbeMemToRowid()` as well; for
+  the classic `INTEGER PRIMARY KEY` case (the overwhelming majority of `OP_RowCell` uses) that
+  dispatches straight through to the previous behavior, unchanged.
+- **`ALTER TABLE ... DROP COLUMN` corrupted narrow-PK values while rewriting the table.** The
+  drop-column row-rewrite in `alter.c` read each row's rowid with a bare `OP_Rowid` and re-inserted
   the row (minus the dropped column) under that same, truncated key. Reproduced directly: dropping
   an unrelated column from a `BLOB(8)`-PK table left one row with a corrupted key and effectively
-  duplicated the row that key collided into, rather than a clean rewrite.
+  duplicated the row that key collided into, rather than a clean rewrite. **Fix:** the same
+  `P4_TABLE` tag on that `OP_Rowid` emission, letting the downstream `OP_Insert` (which already
+  dispatches via `sqlite3VdbeMemToRowid()` unconditionally) re-encode it correctly.
 
-One further, lower-severity issue found the same way:
+One further, lower-severity issue found the same way, also fixed:
 
-- **`PRAGMA foreign_key_check` misreports the offending row for a narrow-PK *child* table.** The
+- **`PRAGMA foreign_key_check` misreported the offending row for a narrow-PK *child* table.** The
   reported "rowid" of the violating row (`pragma.c`, the `OP_Rowid` feeding the check's result-row
-  columns) is read raw, so it shows the truncated/wrong value instead of identifying the actual row —
-  a diagnostic-output-only bug (nothing is corrupted on disk), reproduced directly: the check
-  reported `0` as the child row identifier when the true key was `x'0100000000000000'`.
+  columns) was read raw, so it showed the truncated/wrong value instead of identifying the actual
+  row — a diagnostic-output-only bug (nothing was corrupted on disk), reproduced directly: the check
+  reported `0` as the child row identifier when the true key was `x'0100000000000000'`. **Fix:** same
+  `P4_TABLE` tag, decoding the value into its natural type before it's reported as a query result.
 
 Everything else checked was confirmed safe, either by direct testing or by the raw value never
 crossing into another table's real b-tree key (only ever compared against another equally-raw value
@@ -405,8 +429,13 @@ a correctness issue); `wherecode.c`'s `IN`-operator rowid-list optimization (tes
 `window.c`'s five sites (all operate on window functions' own ephemeral frame-buffer cursor, never
 the real table cursor; tested directly with a windowed aggregate over a narrow-PK-ordered frame);
 `update.c`'s two sites (virtual-table `UPDATE` codegen only — narrow-PK is a real-table-only feature
-by design, unreachable for a virtual table). Not yet fixed, and not otherwise scoped as a numbered
-step — a natural candidate for a small "step 11" if picked up.
+by design, unreachable for a virtual table).
+
+All three fixes were verified with dedicated 8-byte and 16-byte `BLOB` PK repros under both build
+configs, git-stash A/B'd against the pre-fix baseline to confirm each was a genuine, reproducible
+defect (the baseline run visibly corrupted a 16-byte key into a garbled 17-byte value on `VACUUM`),
+and the established regression file set (27 files, incl. all `vacuum*.test`, `alter*dropcol*.test`,
+`alter.test`, `altertab.test`) was run clean (0 errors) under both build configs afterward.
 
 ### 5b. Pre-existing `SQLITE_128BIT_ROWID` foundation bugs (unrelated to narrow-PK)
 

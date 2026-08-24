@@ -2333,7 +2333,19 @@ void sqlite3AlterDropColumn(Parse *pParse, SrcList *pSrc, const Token *pName){
     addr = sqlite3VdbeAddOp1(v, OP_Rewind, iCur); VdbeCoverage(v);
     reg = ++pParse->nMem;
     if( HasRowid(pTab) ){
-      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, reg);
+      /* Narrow-fixed-width-PK-as-rowid (README.md): for a qualifying
+      ** BLOB/TEXT/REAL rowid alias, OP_Rowid must decode the raw rowid_t
+      ** bits back into pTab's natural column type so that reg holds
+      ** something the OP_Insert below (which already dispatches via
+      ** sqlite3VdbeMemToRowid() unconditionally) can correctly re-encode
+      ** -- otherwise reg gets the plain-integer projection, which for a
+      ** narrow-PK table is not the original key. See the OP_Rowid case
+      ** in vdbe.c. */
+      if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        sqlite3VdbeAddOp4(v, OP_Rowid, iCur, reg, 0, (char*)pTab, P4_TABLE);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Rowid, iCur, reg);
+      }
       pParse->nMem += pTab->nCol;
     }else{
       pPk = sqlite3PrimaryKeyIndex(pTab);
