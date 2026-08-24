@@ -163,7 +163,7 @@ forward, with step 1 already done.
    needs `VdbeCursor` itself to know its table's narrow-PK kind/width (populated at cursor-open
    time), not a per-call-site opt-in like step 5 uses; step 7 is the first place this becomes
    reachable, so it's the natural place to fix it structurally rather than repeat step 5's
-   narrower pattern.
+   narrower pattern. (Every remaining site was subsequently audited — see §5a.)
 6. **WHERE-clause/seek integration (done).** `wherecode.c`'s equality (`WHERE_IPK`) and range
    (`OP_SeekGT`/`GE`/`LT`/`LE` start bound, `OP_Rowid`-based end bound) codegen now emits the same
    `P4_TABLE`-gated opcodes as step 5 whenever the seeked column qualifies; `vdbe.c`'s
@@ -350,24 +350,95 @@ forward, with step 1 already done.
   a table keyed by a content hash get the same compact table-b-tree treatment. Not scoped or
   started; would need its own width-generalization pass through the `sqlite3_uint128`-shaped
   arithmetic/comparison/storage layers this fork already built for 128 bits.
-- **Broader `SQLITE_128BIT_ROWID` foundation gaps, unrelated to narrow-PK.** Step 10a's first-ever
-  complete `veryquick.test` run under `SQLITE_128BIT_ROWID` (every prior 128-bit run in this
-  project's history was cut off partway through) surfaced a large cluster of pre-existing failures
-  confirmed (via `git stash` A/B testing) to be completely unrelated to narrow-PK or any step of
-  this feature — spanning `VACUUM`, the `decimal` extension, generated columns, incremental vacuum,
-  page overflow/size handling, sorting, file-format detection, disk-full handling, several FTS3/
-  FTS4 corruption-fuzz suites, and `PRAGMA integrity_check` itself (the `rowidToI64()`-vs-
-  `rowidTruncateToI64()` issue noted under step 10a). None investigated beyond confirming they
-  predate this feature entirely — likely gaps in the wide-rowid foundation (step 1) itself. Worth a
-  dedicated audit pass before considering `SQLITE_128BIT_ROWID` production-ready for anything.
-- Also still open: the `rowidTruncateToI64()` gap from step 5 for the ~19 non-`P4_TABLE`-gated
-  `OP_Rowid` call sites not touched by steps 6–10a (mostly `where.c`/`window.c`'s ephemeral-b-tree
-  uses, believed unaffected in practice but not independently verified), and a recommended
-  defensive audit of `select.c`/`vacuum.c`/`pragma.c` (beyond what step 10a already touched) for
-  the same "assumes plain-64-bit-integer rowid" bug class found in `delete.c` (step 8) and
-  `insert.c`/`expr.c` (step 10a).
+- **Known bugs.** See §5 — a dedicated audit of `SQLITE_128BIT_ROWID` (both the narrow-PK feature's
+  own remaining gaps and pre-existing gaps in the underlying wide-rowid foundation it depends on)
+  was carried out and is tracked there rather than in this list.
 
-## 5. Attribution
+## 5. Known bugs
+
+Confirmed, reproducible bugs under `SQLITE_128BIT_ROWID`, found via a dedicated audit pass (not
+part of the numbered step-by-step plan in §3, and not speculative follow-up work like §4 — these are
+concrete, verified defects). Kept separate and explicit so they aren't lost track of. None of these
+affect a default (non-`SQLITE_128BIT_ROWID`) build.
+
+### 5a. Narrow-PK feature bugs (this fork's own code)
+
+Step 5 flagged that `rowidTruncateToI64()` — used, unchanged, at every `OP_Rowid` call site that
+doesn't carry the `P4_TABLE` tag — takes the LOW 64 bits of a `rowid_t`, which is the wrong half for
+a narrow-PK table's HIGH-aligned embedding (see `rowidFromNarrowBytes()`'s doc comment). Steps 6–10a
+fixed every such site actually reachable by ordinary `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`UPSERT`
+statement execution. This audit (2026-08-24) went through every remaining `OP_Rowid` emission site in
+the codebase (grep for `OP_Rowid,` across `src/*.c`, cross-checked against what's already `P4_TABLE`-
+tagged) and empirically tested each one still in doubt. Two are confirmed broken, both in table-
+maintenance code paths outside ordinary DML:
+
+- **`VACUUM` silently corrupts every row of a narrow-PK table.** `vacuum.c` rebuilds each table via
+  `insert.c`'s `xferOptimization()` fast-copy path, which reads the source table's rowid with a bare
+  `OP_Rowid` (`insert.c`, `pDest->iPKey>=0` branch) and uses it directly as the new row's key. For a
+  narrow-PK table under `SQLITE_128BIT_ROWID`, the low 64 bits this reads are *always zero*
+  (the real bytes live entirely in the high half), so every row collapses onto the same rowid —
+  reproduced directly: a 3-row `BLOB(8)` PK table, after `VACUUM`, has all three rows reporting the
+  identical (wrong) key. The same `xferOptimization()` path is also used by plain
+  `INSERT INTO dst SELECT * FROM src` between two identically-shaped tables — reproduced there too,
+  as a `UNIQUE constraint failed` (the collapsed keys collide) rather than silent data loss, but the
+  underlying defect is identical.
+- **`ALTER TABLE ... DROP COLUMN` corrupts narrow-PK values while rewriting the table.** The
+  drop-column row-rewrite in `alter.c` reads each row's rowid with a bare `OP_Rowid` and re-inserts
+  the row (minus the dropped column) under that same, truncated key. Reproduced directly: dropping
+  an unrelated column from a `BLOB(8)`-PK table left one row with a corrupted key and effectively
+  duplicated the row that key collided into, rather than a clean rewrite.
+
+One further, lower-severity issue found the same way:
+
+- **`PRAGMA foreign_key_check` misreports the offending row for a narrow-PK *child* table.** The
+  reported "rowid" of the violating row (`pragma.c`, the `OP_Rowid` feeding the check's result-row
+  columns) is read raw, so it shows the truncated/wrong value instead of identifying the actual row —
+  a diagnostic-output-only bug (nothing is corrupted on disk), reproduced directly: the check
+  reported `0` as the child row identifier when the true key was `x'0100000000000000'`.
+
+Everything else checked was confirmed safe, either by direct testing or by the raw value never
+crossing into another table's real b-tree key (only ever compared against another equally-raw value
+from the *same* internal bookkeeping structure, so a consistently-wrong value is harmless):
+`where.c`'s bloom-filter construction (`OP_FilterAdd` — performance-only even in the worst case, never
+a correctness issue); `wherecode.c`'s `IN`-operator rowid-list optimization (tested directly: a
+`WHERE k IN (SELECT k FROM t WHERE ...)` query against a narrow-PK column returned correct results);
+`window.c`'s five sites (all operate on window functions' own ephemeral frame-buffer cursor, never
+the real table cursor; tested directly with a windowed aggregate over a narrow-PK-ordered frame);
+`update.c`'s two sites (virtual-table `UPDATE` codegen only — narrow-PK is a real-table-only feature
+by design, unreachable for a virtual table). Not yet fixed, and not otherwise scoped as a numbered
+step — a natural candidate for a small "step 11" if picked up.
+
+### 5b. Pre-existing `SQLITE_128BIT_ROWID` foundation bugs (unrelated to narrow-PK)
+
+Found incidentally while testing the narrow-PK feature (steps 6, 7, 8, 10a), each confirmed via
+`git stash` A/B testing to reproduce identically with none of this feature's code present — i.e.
+these are gaps in the wide-rowid foundation (step 1) itself, or in wholly unrelated subsystems,
+predating and unrelated to narrow-PK-as-rowid. None investigated beyond confirming they predate this
+feature; each would need its own root-cause pass.
+
+- `PRAGMA integrity_check` reports a false "Rowid N out of order" for *any* narrow-PK table (not just
+  ones with a secondary index) — `btree.c`'s `checkTreePage()` uses the assert-on-overflow
+  `rowidToI64()` instead of the safe `rowidTruncateToI64()` on table b-tree cell keys, which can't
+  represent a narrow-PK rowid_t's high-aligned embedding. (This one specifically involves narrow-PK
+  data, but the defect is in generic, pre-existing integrity-check code, not in this fork's own
+  narrow-PK code paths — hence listed here rather than in §5a.)
+- `test/boundary1.test`, `test/boundary3.test`, `test/boundary4.test` — huge plain-`INTEGER` rowid
+  values.
+- `ext/fts5/test/fts5contentless2.test`, `fts5origintext4.test` — FTS5's internal rowid bookkeeping.
+- `test/amatch1.test`, `test/altercorrupt.test` — corruption-recovery paths.
+- Several `ext/recover/*` tests, `ext/rtree/rtreefuzz001.test` — recovery/R-tree fuzz corpora.
+- `test/vacuum6.test`, `test/decimal.test`, `test/resetdb.test`, `test/gencol1.test`, one sub-case of
+  `test/pragma.test`, `test/dbfuzz001.test`, `test/filefmt.test`, `test/sort5.test`,
+  `test/incrvacuum.test`, `test/pagesize.test`, `test/ovfl.test`, plus clusters of `corruptL`/
+  `corruptN`/`dbpage`/`diskfull`/`fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases — surfaced by
+  step 10a's `veryquick.test` run, the first one in this project's history to ever run to completion
+  under `SQLITE_128BIT_ROWID` (every earlier attempt was cut off partway through before reaching
+  these test files).
+
+Worth a dedicated audit pass of its own before considering `SQLITE_128BIT_ROWID` production-ready for
+anything beyond this fork's own narrow-PK feature.
+
+## 6. Attribution
 
 This fork's direction, goals, and design decisions — including every constraint, tradeoff, and
 safety mechanism described in §2 — are [Ambeco](https://github.com/Ambeco)'s. Claude (Anthropic)
