@@ -280,11 +280,13 @@ forward, with step 1 already done.
 
 - **Secondary indexes on a narrow-PK table.** Currently refused outright (see step 7) because every
   index b-tree entry's trailing rowid field is a plain `INTEGER` in SQLite's on-disk format, which a
-  narrow-PK `rowid_t` cannot in general populate correctly. Lifting this needs either (a) a real
-  `BLOB`/`TEXT`/`REAL`-aware conversion at index-key-construction time for the ≤8-byte case (where
-  the raw `rowid_t` bits *do* fit in a 64-bit integer field, just not as the identity mapping
-  `OP_IntCopy` assumes today), or (b) a genuine on-disk format change to let that trailing field carry
-  more than 64 bits for the `SQLITE_128BIT_ROWID`-only >8-byte case. Not scoped or started.
+  narrow-PK `rowid_t` cannot in general populate correctly. **Scoped, 2026-08-24 (design memory has
+  the full writeup; not started)** as two stages: **step 10a**, a real `BLOB`/`TEXT`/`REAL`-aware
+  conversion at index-key-construction time for the ≤8-byte case (the raw `rowid_t` bits *do* fit in
+  a 64-bit integer field, just not via the identity mapping `OP_IntCopy` assumes today) — no format
+  change, works in both build configs, recommended first since it covers the overwhelmingly common
+  case; and **step 10b**, a genuine on-disk format change (repurposing the reserved-and-unused record
+  serial type 11 as a fixed 16-byte field) for the `SQLITE_128BIT_ROWID`-only 9–16-byte case.
 - **Type-spelling synonyms.** Only exact `BLOB`/`TEXT`/`REAL` qualify today; `CHAR`/`VARCHAR`/
   `NCHAR`/`NVARCHAR`/`CLOB` (text-like) and `DOUBLE`/`FLOAT`/`DOUBLE PRECISION` (real-like) are
   deliberately out of scope for the initial implementation. Follow-up: either extend eligibility to
