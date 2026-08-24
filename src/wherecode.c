@@ -1321,6 +1321,27 @@ static void codeDeferredSeek(
       }
       sqlite3VdbeChangeP4(v, -1, (char*)ai, P4_INTARRAY);
     }
+  }else if( pIdx->pTable->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+    /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: tag P4_TABLE
+    ** (mutually exclusive with the P4_INTARRAY case above -- the two
+    ** conditions can't both hold today, since P4_INTARRAY requires an
+    ** empty writeMask, i.e. a pure-read context, while reaching this
+    ** function's deferred-seek target is itself always a real table row
+    ** whose rowid needs step 5's decode-on-use treatment regardless of
+    ** which branch is live) so vdbe.c's OP_DeferredSeek handler knows to
+    ** re-embed the rowid it reads back from the index using this table's
+    ** HIGH-aligned convention (rowidFromNarrowBytes()) rather than the
+    ** LOW-aligned one sqlite3VdbeIdxRowid() always assumes -- see its own
+    ** comment, and OP_IdxRowid's identical fixup earlier in the same
+    ** shared vdbe.c case, for the full explanation. A >8-byte-wide alias
+    ** can't reach this code at all: build.c refuses to let such a table
+    ** have any index (step 10b territory). KNOWN GAP: if a future change
+    ** ever makes both conditions true simultaneously (a narrow-PK table
+    ** read via the OR-subclause/right-join deferred-seek optimization),
+    ** this branch loses to the one above and the rowid fixup is skipped --
+    ** the P4 slot can only hold one of the two. */
+    assert( pIdx->pTable->pKeyWidth<=8 );
+    sqlite3VdbeAppendP4(v, pIdx->pTable, P4_TABLE);
   }
 }
 

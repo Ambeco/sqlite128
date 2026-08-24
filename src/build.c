@@ -2945,26 +2945,25 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
           "has collation %s, which this optimization requires to be BINARY",
           zColl);
     }
-  }else if( pTab->pIndex!=0 ){
+  }else if( pTab->pIndex!=0 && kind!=COLTYPE_REAL && wCheck>8 ){
     /* A secondary index (from an earlier UNIQUE column/table constraint
     ** parsed within this same CREATE TABLE statement) already exists on
     ** this table. Every index's b-tree entries end with a plain-INTEGER
     ** trailing "rowid" field per SQLite's on-disk format (see
-    ** sqlite3VdbeIdxRowid()'s explicit serial-type check) -- but a
-    ** narrow-PK rowid_t is not, in general, representable as a plain
-    ** INTEGER (it may be wider than 64 bits, or hold BLOB/TEXT/REAL bytes
-    ** that must not be reinterpreted as an integer). Building this table
-    ** as narrow-PK here would silently corrupt every secondary index (and
-    ** any query plan that uses one as a covering index for this column).
-    ** Until that on-disk representation gap is addressed by its own
-    ** dedicated step, refuse narrow-PK qualification whenever another
-    ** index already exists, exactly as if the CHECK/NOT NULL constraints
-    ** were missing -- the table falls back to an ordinary (fully
-    ** mainline-compatible) indexed PRIMARY KEY instead. */
+    ** sqlite3VdbeIdxRowid()'s explicit serial-type check). Step 10a
+    ** (README.md) made that representable for a <=8-byte-wide rowid_t
+    ** (BLOB/TEXT up to 8 bytes, or REAL, which is always exactly 8) via a
+    ** real conversion instead of the old blind OP_IntCopy -- but a WIDER
+    ** rowid_t genuinely cannot fit that field without a further, not-yet-
+    ** implemented on-disk format change (step 10b). Refuse narrow-PK
+    ** qualification only in that still-unsupported >8-byte case, exactly
+    ** as if the CHECK/NOT NULL constraints were missing -- the table
+    ** falls back to an ordinary (fully mainline-compatible) indexed
+    ** PRIMARY KEY instead of silently corrupting every secondary index. */
     zReasonAlloc = sqlite3MPrintf(db,
         "cannot be combined with another index or UNIQUE constraint on the "
         "same table -- secondary indexes on a narrow rowid-optimized "
-        "primary key are not yet supported");
+        "primary key wider than 8 bytes are not yet supported");
   }
 
   if( zReason || zReasonAlloc ){
@@ -4530,20 +4529,22 @@ void sqlite3CreateIndex(
   ** (pTblName!=0 distinguishes this from a UNIQUE/PK column constraint
   ** parsed as part of the CREATE TABLE itself -- that case is caught
   ** earlier, in narrowPKFinalize(), before tabFlags is even set). See the
-  ** narrowPKFinalize() comment on the identical guard for why this must be
-  ** refused rather than silently built: every index's b-tree entries end
-  ** with a plain-INTEGER trailing rowid field, which cannot represent a
-  ** narrow-PK rowid_t in general. Stay lenient while loading a pre-existing
-  ** schema (db->init.busy) -- refusing here would just make an existing
-  ** database file unopenable; only block *creating* new instances of this
-  ** unsupported combination going forward. */
+  ** narrowPKFinalize() comment on the identical guard for why a >8-byte-
+  ** wide rowid_t must still be refused here (step 10a made the <=8-byte
+  ** case, including REAL, representable via a real conversion instead of
+  ** a blind copy; step 10b, not yet implemented, is needed for wider).
+  ** Stay lenient while loading a pre-existing schema (db->init.busy) --
+  ** refusing here would just make an existing database file unopenable;
+  ** only block *creating* new instances of this unsupported combination
+  ** going forward. */
   if( pTblName!=0 && !db->init.busy
    && (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0
+   && pTab->pKeyWidth>8
   ){
     sqlite3ErrorMsg(pParse,
         "table \"%s\": cannot create another index -- secondary indexes on "
-        "a narrow rowid-optimized primary key are not yet supported",
-        pTab->zName);
+        "a narrow rowid-optimized primary key wider than 8 bytes are not "
+        "yet supported", pTab->zName);
     goto exit_create_index;
   }
 #ifndef SQLITE_OMIT_VIEW

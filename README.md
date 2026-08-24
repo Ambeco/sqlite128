@@ -275,26 +275,52 @@ forward, with step 1 already done.
      type string (`BLOB(8)`, `TEXT(4)`, `REAL`) for a qualifying narrow-PK column, unchanged from
      what an ordinary column of that declared type would show — nothing about the rowid-aliasing
      internals leaks into the declared-type string.
-10. **Secondary indexes on a narrow-PK table (scoped 2026-08-24, not started).** Step 7 discovered
-    that a narrow-PK table combined with any secondary index or `UNIQUE` constraint silently
-    corrupted data, and refused the combination outright as a stopgap. Root cause: every index
-    b-tree entry's trailing "rowid" field is required, by `sqlite3VdbeIdxRowid()`, to be a plain
-    classic-integer record serial type — but `insert.c`'s index-key-construction code
-    (`OP_IntCopy`) blindly assumes the source register already holds one, which is false for a
-    narrow-PK table's decoded `BLOB`/`TEXT`/`REAL` value. Scoped as two stages (full technical
-    writeup, including exact call sites and the reasoning for each design choice, is in the
-    project's design memory):
-    - **Step 10a (≤8-byte narrow-PK, no on-disk format change, works in both build configs).** The
-      raw `rowid_t` bits for a narrow-PK width up to 8 bytes already fit a normal 64-bit integer
-      serial type — `insert.c` just needs to actually perform that conversion instead of blindly
-      copying. Also needs reinstating (and extending to `OP_IdxRowid`) the `P4_TABLE`-decode
-      mechanism already proven for `OP_Rowid` in steps 5–8, at each `OP_IdxRowid` consumer
-      (`where.c`'s covering-index cursor-translation rewrite, `pragma.c`'s `integrity_check`,
-      `upsert.c`), plus relaxing step 7's two `CREATE TABLE`/`CREATE INDEX` guards to be conditional
-      on `pTab->pKeyWidth` rather than an unconditional refusal. Recommended to implement first: it
-      covers the overwhelmingly common case (any `BLOB`/`TEXT` primary key up to 8 bytes) with no
-      format change at all.
-    - **Step 10b (9–16-byte narrow-PK, `SQLITE_128BIT_ROWID`-only, genuine on-disk format change).**
+10. **Secondary indexes on a narrow-PK table.** Step 7 discovered that a narrow-PK table combined
+    with any secondary index or `UNIQUE` constraint silently corrupted data, and refused the
+    combination outright as a stopgap. Root cause: every index b-tree entry's trailing "rowid"
+    field is required, by `sqlite3VdbeIdxRowid()`, to be a plain classic-integer record serial
+    type — but `insert.c`'s index-key-construction code (`OP_IntCopy`) blindly assumed the source
+    register already held one, which is false for a narrow-PK table's decoded `BLOB`/`TEXT`/`REAL`
+    value. Scoped as two stages (full technical writeup, including exact call sites and the
+    reasoning for each design choice, is in the project's design memory):
+    - **Step 10a (≤8-byte narrow-PK, no on-disk format change, works in both build configs) —
+      done.** The raw `rowid_t` bits for a narrow-PK width up to 8 bytes already fit a normal
+      64-bit integer serial type, via two new helpers (`rowidToIdxInt64()`/`rowidFromIdxInt64()`
+      in `sqliteInt.h`) that project a rowid_t to/from that representation — `OP_IntCopy` now does
+      this conversion (`P4_TABLE`-gated) instead of blindly copying, fixing the actual step-7 bug.
+      Reading it back correctly needed the `P4_TABLE`-decode mechanism (already proven for
+      `OP_Rowid` since step 5) extended to two more opcodes: `OP_IdxRowid` (covering-index reads,
+      `upsert.c`'s conflict-resolution seek) and `OP_DeferredSeek` (which shares the same `vdbe.c`
+      case block as `OP_IdxRowid` but needed a separate fix, since its `P4` slot was already used
+      for an unrelated `P4_INTARRAY` optimization — the two are now mutually exclusive at the
+      `wherecode.c` emission site, with a documented, narrow, known-gap corner case where both
+      would apply simultaneously). `expr.c`'s `sqlite3ExprCodeLoadIndexColumn()` needed its own
+      fix too: it independently used the *decoded natural-type* chokepoint to build an index
+      search/comparison key, which no longer matched what `insert.c` actually stores on disk — this
+      was the root cause of spurious "row missing from index" errors in `pragma.c`'s
+      `integrity_check` and in `DELETE`'s index cleanup. `build.c`'s two `CREATE TABLE`/`CREATE
+      INDEX` guards are now conditional on `pTab->pKeyWidth` (≤8 allowed, >8 still refused pending
+      step 10b) instead of an unconditional refusal. Verified: covering-index reads, `DELETE`
+      (including the two-pass path), `UPDATE`, `UPSERT` via a secondary unique index, `ANALYZE`,
+      inline `UNIQUE` column constraints, and the full regression suite under both a default and a
+      `SQLITE_128BIT_ROWID` build (targeted files clean under both; a complete `veryquick.test` run
+      under `SQLITE_128BIT_ROWID` — the first one in this project to ever run to completion instead
+      of being cut off partway — surfaced a large cluster of genuinely pre-existing wide-rowid gaps
+      unrelated to narrow-PK, see the note below).
+      **Newly-discovered pre-existing gap (not step-10a-caused, confirmed via `git stash` A/B
+      testing against the step-9 commit):** `PRAGMA integrity_check` itself reports a false "Rowid 0
+      out of order" for *any* narrow-PK table under `SQLITE_128BIT_ROWID` — with or without a
+      secondary index — because `btree.c`'s `checkTreePage()` uses the assert-on-overflow
+      `rowidToI64()` (not the safe `rowidTruncateToI64()`) on table b-tree cell keys, which can't
+      represent a narrow-PK rowid_t's high-aligned embedding. A much larger set of pre-existing,
+      completely unrelated `SQLITE_128BIT_ROWID` gaps (spanning `VACUUM`, the `decimal` extension,
+      generated columns, incremental vacuum, page overflow/size handling, sorting, file-format
+      detection, disk-full handling, several FTS3/FTS4 corruption-fuzz suites, and more) was also
+      newly surfaced by that first-ever complete `veryquick.test` run — all confirmed pre-existing
+      via the same A/B method, none related to narrow-PK or any step of this feature; see the
+      design memory for the full list and the "still open" follow-up note below.
+    - **Step 10b (9–16-byte narrow-PK, `SQLITE_128BIT_ROWID`-only, genuine on-disk format change,
+      not started).**
       A 9–16-byte `rowid_t` cannot fit any existing integer serial type, so this stage repurposes
       record serial type 11 — confirmed reserved and completely unused anywhere in this codebase or
       by mainline SQLite (unlike type 10, which already has a real meaning: the
@@ -324,6 +350,22 @@ forward, with step 1 already done.
   a table keyed by a content hash get the same compact table-b-tree treatment. Not scoped or
   started; would need its own width-generalization pass through the `sqlite3_uint128`-shaped
   arithmetic/comparison/storage layers this fork already built for 128 bits.
+- **Broader `SQLITE_128BIT_ROWID` foundation gaps, unrelated to narrow-PK.** Step 10a's first-ever
+  complete `veryquick.test` run under `SQLITE_128BIT_ROWID` (every prior 128-bit run in this
+  project's history was cut off partway through) surfaced a large cluster of pre-existing failures
+  confirmed (via `git stash` A/B testing) to be completely unrelated to narrow-PK or any step of
+  this feature — spanning `VACUUM`, the `decimal` extension, generated columns, incremental vacuum,
+  page overflow/size handling, sorting, file-format detection, disk-full handling, several FTS3/
+  FTS4 corruption-fuzz suites, and `PRAGMA integrity_check` itself (the `rowidToI64()`-vs-
+  `rowidTruncateToI64()` issue noted under step 10a). None investigated beyond confirming they
+  predate this feature entirely — likely gaps in the wide-rowid foundation (step 1) itself. Worth a
+  dedicated audit pass before considering `SQLITE_128BIT_ROWID` production-ready for anything.
+- Also still open: the `rowidTruncateToI64()` gap from step 5 for the ~19 non-`P4_TABLE`-gated
+  `OP_Rowid` call sites not touched by steps 6–10a (mostly `where.c`/`window.c`'s ephemeral-b-tree
+  uses, believed unaffected in practice but not independently verified), and a recommended
+  defensive audit of `select.c`/`vacuum.c`/`pragma.c` (beyond what step 10a already touched) for
+  the same "assumes plain-64-bit-integer rowid" bug class found in `delete.c` (step 8) and
+  `insert.c`/`expr.c` (step 10a).
 
 ## 5. Attribution
 

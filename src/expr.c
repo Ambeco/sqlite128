@@ -4411,12 +4411,38 @@ void sqlite3ExprCodeLoadIndexColumn(
   int regOut      /* Store the index column value in this register */
 ){
   i16 iTabCol = pIdx->aiColumn[iIdxCol];
+  Table *pTab = pIdx->pTable;
   if( iTabCol==XN_EXPR ){
     assert( pIdx->aColExpr );
     assert( pIdx->aColExpr->nExpr>iIdxCol );
     pParse->iSelfTab = iTabCur + 1;
     sqlite3ExprCodeCopy(pParse, pIdx->aColExpr->a[iIdxCol].pExpr, regOut);
     pParse->iSelfTab = 0;
+  }else if( (iTabCol<0 || iTabCol==pTab->iPKey)
+   && (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0
+  ){
+    /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: this is the
+    ** trailing rowid slot of a rowid-table index's key -- NOT a real
+    ** table column, so the ordinary sqlite3ExprCodeGetColumnOfTable()
+    ** chokepoint below is the wrong tool here: it decodes the rowid back
+    ** to the column's natural BLOB/TEXT/REAL type (correct for a genuine
+    ** SELECT of that column), but insert.c stores this slot as the
+    ** classic-integer-compatible rowidToIdxInt64() PROJECTION instead
+    ** (required by SQLite's on-disk index format -- see build.c's
+    ** narrowPKFinalize() comment). A search/comparison key built here
+    ** must match that on-disk representation exactly, not the decoded
+    ** value, or OP_Found/OP_IFindKey and friends will never see a match.
+    ** Read the natural value via the same OP_Rowid+P4_TABLE decode as
+    ** always, then re-run it through OP_IntCopy's own P4_TABLE branch
+    ** (the exact conversion insert.c's storage path already uses) to
+    ** land on the identical projection. A >8-byte-wide alias can't reach
+    ** this code at all: build.c refuses to let such a table have any
+    ** index (step 10b territory). */
+    assert( pTab->pKeyWidth<=8 );
+    sqlite3VdbeAddOp2(pParse->pVdbe, OP_Rowid, iTabCur, regOut);
+    sqlite3VdbeAppendP4(pParse->pVdbe, pTab, P4_TABLE);
+    sqlite3VdbeAddOp2(pParse->pVdbe, OP_IntCopy, regOut, regOut);
+    sqlite3VdbeAppendP4(pParse->pVdbe, pTab, P4_TABLE);
   }else{
     sqlite3ExprCodeGetColumnOfTable(pParse->pVdbe, pIdx->pTable, iTabCur,
                                     iTabCol, regOut);

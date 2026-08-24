@@ -2472,8 +2472,19 @@ void sqlite3GenerateConstraintChecks(
         pParse->iSelfTab = 0;
         VdbeComment((v, "%s column %d", pIdx->zName, i));
       }else if( iField==XN_ROWID || iField==pTab->iPKey ){
+        /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: for a
+        ** qualifying <=8-byte-wide BLOB/TEXT/REAL rowid alias, regNewData
+        ** holds the decoded natural-typed value here, not a plain integer
+        ** -- tag P4_TABLE so OP_IntCopy converts it properly instead of
+        ** blindly copying (see its case in vdbe.c). A >8-byte-wide alias
+        ** can't reach this code at all: build.c refuses to let such a
+        ** table have any index in the first place (step 10b territory). */
         x = regNewData;
         sqlite3VdbeAddOp2(v, OP_IntCopy, x, regIdx+i);
+        if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+          assert( pTab->pKeyWidth<=8 );
+          sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+        }
         VdbeComment((v, "rowid"));
       }else{
         testcase( sqlite3TableColumnToStorage(pTab, iField)!=iField );

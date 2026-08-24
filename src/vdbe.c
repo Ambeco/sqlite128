@@ -1766,9 +1766,26 @@ case OP_SCopy: {            /* out2 */
 */
 case OP_IntCopy: {            /* out2 */
   pIn1 = &aMem[pOp->p1];
-  assert( (pIn1->flags & MEM_Int)!=0 );
   pOut = &aMem[pOp->p2];
-  sqlite3VdbeMemSetInt64(pOut, pIn1->u.i);
+  /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: this opcode has
+  ** exactly one emission site (insert.c's index-key-construction loop,
+  ** which tags P4_TABLE here only for a qualifying <=8-byte-wide rowid
+  ** alias). pIn1 then holds the DECODED narrow-PK value (BLOB/TEXT/REAL),
+  ** not a plain integer -- convert to rowid_t (the same
+  ** sqlite3VdbeMemToRowid() dispatch every write-side chokepoint since
+  ** step 4 uses) and project to the classic-integer-compatible 64-bit
+  ** representation the index's trailing rowid field is required to hold
+  ** (see rowidToIdxInt64()'s own comment for why this must not be a plain
+  ** rowidTruncateToI64()). Every other OP_IntCopy site (none exist today,
+  ** but any future one) omits P4 and gets the original, unchanged
+  ** behavior. */
+  if( pOp->p4type==P4_TABLE ){
+    rowid_t rt = sqlite3VdbeMemToRowid(pIn1);
+    sqlite3VdbeMemSetInt64(pOut, rowidToIdxInt64(rt));
+  }else{
+    assert( (pIn1->flags & MEM_Int)!=0 );
+    sqlite3VdbeMemSetInt64(pOut, pIn1->u.i);
+  }
   break;
 }
 
@@ -7173,22 +7190,55 @@ case OP_IdxRowid: {           /* out2, ncycle */
       assert( pTabCur->uc.pCursor!=0 );
       assert( pTabCur->isTable );
 #if defined(SQLITE_ENABLE_CURSOR_HINTS) && defined(SQLITE_DEBUG)
-      assert( 
-          sqlite3BtreeCursorHintTblCsr(pC->uc.pCursor)==pTabCur->uc.pCursor 
+      assert(
+          sqlite3BtreeCursorHintTblCsr(pC->uc.pCursor)==pTabCur->uc.pCursor
       );
 #endif
       pTabCur->nullRow = 0;
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a:
+      ** wherecode.c's codeDeferredSeek() tags P4_TABLE here (mutually
+      ** exclusive with the P4_INTARRAY case just below -- see its own
+      ** comment) for a qualifying <=8-byte-wide rowid alias, since
+      ** sqlite3VdbeIdxRowid() above always reconstructs via
+      ** rowidFromI64()'s LOW-bit-embedded convention, which is wrong for
+      ** this table's real HIGH-aligned embedding (see OP_IdxRowid's own
+      ** identical fixup, earlier in this same shared case, for the full
+      ** explanation). Fix it up the same way before it's used to seek. */
+      if( pOp->p4type==P4_TABLE ){
+        rowid = rowidFromIdxInt64(rowidTruncateToI64(rowid));
+      }
       pTabCur->movetoTarget = rowid;
       pTabCur->deferredMoveto = 1;
       pTabCur->cacheStatus = CACHE_STALE;
-      assert( pOp->p4type==P4_INTARRAY || pOp->p4.ai==0 );
+      assert( pOp->p4type==P4_INTARRAY || pOp->p4type==P4_TABLE
+           || pOp->p4.ai==0 );
       assert( !pTabCur->isEphemeral );
-      pTabCur->ub.aAltMap = pOp->p4.ai;
+      pTabCur->ub.aAltMap = pOp->p4type==P4_INTARRAY ? pOp->p4.ai : 0;
       assert( !pC->isEphemeral );
       pTabCur->pAltCursor = pC;
     }else{
       pOut = out2Prerelease(p, pOp);
-      pOut->u.i = rowidTruncateToI64(rowid);  /* Mem.u.i is a plain i64 */
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: where.c's
+      ** covering-index cursor-translation pass preserves whatever P4 the
+      ** original OP_Rowid carried when rewriting it to OP_IdxRowid, so a
+      ** P4_TABLE tag can arrive here for a qualifying <=8-byte-wide rowid
+      ** alias read via a covering index. sqlite3VdbeIdxRowid() above
+      ** always reconstructs via rowidFromI64()'s LOW-bit-embedded
+      ** convention (the only one it knows about, correct for a classic
+      ** INTEGER PK) -- wrong for a narrow-PK table, whose real embedding
+      ** is HIGH-aligned (see rowidFromNarrowBytes()). Re-derive the
+      ** correctly-embedded rowid_t from the same underlying 64-bit value
+      ** (rowidFromI64()/rowidTruncateToI64() are exact inverses, so this
+      ** recovers the original stored integer losslessly), then decode it
+      ** to the natural type exactly as OP_Rowid's own P4_TABLE branch
+      ** does -- every other OP_IdxRowid emission site omits P4 and is
+      ** unchanged. */
+      if( pOp->p4type==P4_TABLE ){
+        rowid_t rt = rowidFromIdxInt64(rowidTruncateToI64(rowid));
+        sqlite3VdbeMemSetRowid(pOut, rt, pOp->p4.pTab);
+      }else{
+        pOut->u.i = rowidTruncateToI64(rowid);  /* Mem.u.i is a plain i64 */
+      }
     }
   }else{
     assert( pOp->opcode==OP_IdxRowid );

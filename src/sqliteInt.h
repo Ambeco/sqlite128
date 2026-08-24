@@ -1162,6 +1162,51 @@ static SQLITE_INLINE double rowidToReal(rowid_t x){
   return r;
 }
 
+/*
+** rowidToIdxInt64()/rowidFromIdxInt64(): project a rowid_t to/from a plain
+** i64, for use ONLY on a narrow-PK-as-rowid (README.md) BLOB/TEXT/REAL
+** column whose declared width is <=8 bytes -- i.e. narrower than
+** NARROWPK_MAX_WIDTH can ever be under SQLITE_128BIT_ROWID. This is the
+** step-10a mechanism that lets a secondary index's trailing rowid field
+** (which sqlite3VdbeIdxRowid() requires be an ordinary classic-integer
+** record field, per SQLite's on-disk index format) hold such a value
+** losslessly with NO on-disk format change: a <=8-byte embed's real bytes
+** always sit in the HIGH 8 bytes of the full rowid_t (see
+** rowidFromNarrowBytes()'s embedding convention above), with any lower
+** bytes (only possible when NARROWPK_MAX_WIDTH>8, i.e. under
+** SQLITE_128BIT_ROWID) always zero -- so projecting down to just those
+** high 8 bytes is lossless for any width<=8, regardless of which width
+** was actually used to create the original rowid_t.
+**
+** This is NOT the same operation as rowidToI64()/rowidTruncateToI64(),
+** which take the LOW 64 bits -- the correct place for an ordinary
+** INTEGER PRIMARY KEY's value, embedded via rowidFromI64()'s different,
+** low-aligned (sign-extending) convention. Using those here would
+** silently read back as zero for any width<=8 under SQLITE_128BIT_ROWID,
+** since that's exactly the (always-zero) low half of a high-aligned
+** embed. Never mix the two conventions: this pair is for the narrow-PK
+** high-aligned embedding specifically, nothing else.
+**
+** A default (non-SQLITE_128BIT_ROWID) build has NARROWPK_MAX_WIDTH==8, so
+** there is no separate high/low half at all and this degrades to a plain
+** identity cast -- these exist so the *source* is portable between
+** representations, matching every other rowidFromX()/rowidToX() pair.
+*/
+static SQLITE_INLINE i64 rowidToIdxInt64(rowid_t x){
+#ifdef SQLITE_128BIT_ROWID
+  return (i64)int128ToU64(int128ShiftRight(x, (NARROWPK_MAX_WIDTH-8)*8));
+#else
+  return (i64)x;
+#endif
+}
+static SQLITE_INLINE rowid_t rowidFromIdxInt64(i64 v){
+#ifdef SQLITE_128BIT_ROWID
+  return int128ShiftLeft(int128FromU64((u64)v), (NARROWPK_MAX_WIDTH-8)*8);
+#else
+  return (rowid_t)v;
+#endif
+}
+
 /* A bitfield type for use inside of structures.  Always follow with :N where
 ** N is the number of bits.
 */

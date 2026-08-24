@@ -286,8 +286,27 @@ void sqlite3UpsertDoUpdate(
   if( pIdx && iCur!=iDataCur ){
     if( HasRowid(pTab) ){
       int regRowid = sqlite3GetTempReg(pParse);
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: for a
+      ** qualifying <=8-byte-wide rowid alias, both opcodes need the same
+      ** P4_TABLE tag already used elsewhere -- OP_IdxRowid so it decodes
+      ** the value read off the index back to its natural BLOB/TEXT/REAL
+      ** type (see its case in vdbe.c) instead of leaving the classic-
+      ** integer-only fallback to trip over it, and OP_SeekRowid so it
+      ** re-encodes that natural value into the table's actual rowid_t
+      ** (the same mechanism wherecode.c's WHERE_IPK equality case uses,
+      ** step 6) instead of falling into ITS OWN classic-integer-only
+      ** fallback. A >8-byte-wide alias can't reach this code at all:
+      ** build.c refuses to let such a table have any index (step 10b
+      ** territory). */
       sqlite3VdbeAddOp2(v, OP_IdxRowid, iCur, regRowid);
+      if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        assert( pTab->pKeyWidth<=8 );
+        sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      }
       sqlite3VdbeAddOp3(v, OP_SeekRowid, iDataCur, 0, regRowid);
+      if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      }
       VdbeCoverage(v);
       sqlite3ReleaseTempReg(pParse, regRowid);
     }else{
