@@ -192,8 +192,39 @@ forward, with step 1 already done.
    FTS5's internal rowid bookkeeping, and corruption-recovery paths, none of which involve a
    narrow-PK table; they're a gap in the wide-rowid foundation (step 1) itself, not something this
    feature introduced.
-7. **UPDATE codegen (not started).** Analogous to step 4, for `UPDATE` statements touching the PK
-   column.
+7. **UPDATE codegen (done).** `update.c`'s old/new-rowid bookkeeping now correctly round-trips a
+   qualifying `BLOB`/`TEXT`/`REAL` rowid alias through an `UPDATE`, including when the PK column
+   itself is the one being changed. Three sites needed the same `P4_TABLE`-gated `OP_Rowid` treatment
+   as step 5's SELECT read-back: the initial "read the WHERE-scan's current row's old rowid"
+   (`iDataCur`), and — less obviously — the *two* places that read that same value back out of the
+   ephemeral FIFO table (`OP_Rowid, iEph, ...`) used for the non-onepass update loop. That second
+   case matters even though `iEph` itself is never a narrow-PK table: its stored key is bit-identical
+   to `pTab`'s real key (both went through the same `sqlite3VdbeMemToRowid()` encode), so decoding it
+   back needs `P4_TABLE=pTab` regardless of which physical cursor is being read — it's the encoding's
+   origin table that matters, not the cursor. `OP_MustBeInt` on the new-rowid register is skipped for
+   a qualifying table exactly as `insert.c`'s `bClassicIntRowid` guard already does. Verified: single-
+   and multi-row (`ONEPASS_OFF`/multi-row self-`UPDATE`) PK-value changes, PK-collision rejection,
+   `DELETE`, and `REAL`/`TEXT`/`BLOB(16)` variants, plus the full regression suite under both a
+   default and a `SQLITE_128BIT_ROWID` build (only the two known/expected failures).
+   **Significant pre-existing gap discovered during this step's verification, NOT step-7-specific
+   (present since step 4's INSERT codegen, just never exercised by a test table with a secondary
+   index until now) and guarded against rather than fixed:** a table with a qualifying narrow-PK
+   *and* any other index (an explicit `CREATE INDEX`, or a `UNIQUE` column/table constraint) silently
+   corrupted data before this step. Root cause: every index b-tree entry in SQLite's on-disk format
+   ends with a plain-`INTEGER`-typed trailing "rowid" field (`sqlite3VdbeIdxRowid()` explicitly
+   rejects any other serial type as corruption) — but `insert.c`'s index-key-construction code
+   (`OP_IntCopy` at the `iField==pTab->iPKey` case) blindly treats the source register as already
+   holding that integer, when for a narrow-PK table it instead holds the natural decoded `BLOB`/
+   `TEXT`/`REAL` value. A `rowid_t` also generally cannot losslessly fit in that field's 64-bit width
+   at all under `SQLITE_128BIT_ROWID`. Rather than attempt a fix (which needs either restricting to
+   the ≤8-byte case with a real conversion, or a genuine on-disk-format change for the wide case —
+   both out of scope here), `build.c` now refuses to let a table become narrow-PK if it already has
+   another index (an inline `UNIQUE` constraint parsed earlier in the same `CREATE TABLE`), and
+   refuses a later separate `CREATE INDEX`/`UNIQUE` against an already-qualified narrow-PK table —
+   both with a clear error message, falling back to (or requiring) an ordinary, fully mainline-
+   compatible indexed `PRIMARY KEY` instead of silently corrupting the database. This is a real,
+   user-facing limitation of the feature as it stands (no secondary indexes on a narrow-PK table)
+   that a future step would need to lift.
 8. **Foreign-key verification (not started).** Confirm `fkey.c` correctly handles a parent table
    using one of the new rowid kinds — this is the feature's original motivating use case (a UUID
    primary key referenced by a foreign key).
@@ -204,6 +235,13 @@ forward, with step 1 already done.
 
 ## 4. Potential follow-up work
 
+- **Secondary indexes on a narrow-PK table.** Currently refused outright (see step 7) because every
+  index b-tree entry's trailing rowid field is a plain `INTEGER` in SQLite's on-disk format, which a
+  narrow-PK `rowid_t` cannot in general populate correctly. Lifting this needs either (a) a real
+  `BLOB`/`TEXT`/`REAL`-aware conversion at index-key-construction time for the ≤8-byte case (where
+  the raw `rowid_t` bits *do* fit in a 64-bit integer field, just not as the identity mapping
+  `OP_IntCopy` assumes today), or (b) a genuine on-disk format change to let that trailing field carry
+  more than 64 bits for the `SQLITE_128BIT_ROWID`-only >8-byte case. Not scoped or started.
 - **Type-spelling synonyms.** Only exact `BLOB`/`TEXT`/`REAL` qualify today; `CHAR`/`VARCHAR`/
   `NCHAR`/`NVARCHAR`/`CLOB` (text-like) and `DOUBLE`/`FLOAT`/`DOUBLE PRECISION` (real-like) are
   deliberately out of scope for the initial implementation. Follow-up: either extend eligibility to

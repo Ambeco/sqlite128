@@ -769,8 +769,21 @@ void sqlite3Update(
     if( HasRowid(pTab) ){
       /* Read the rowid of the current row of the WHERE scan. In ONEPASS_OFF
       ** mode, write the rowid into the FIFO. In either of the one-pass modes,
-      ** leave it in register regOldRowid.  */
+      ** leave it in register regOldRowid.
+      **
+      ** Narrow-fixed-width-PK-as-rowid (README.md): when pTab's rowid alias
+      ** is a BLOB/TEXT/REAL column, tag this OP_Rowid with P4_TABLE so it
+      ** decodes the full-width rowid_t back into regOldRowid's natural type
+      ** (same mechanism as expr.c's SELECT read-back) instead of truncating
+      ** it to a bare i64 -- regOldRowid is later fed to OP_NotExists (which
+      ** already dispatches on the Mem's own flags via
+      ** sqlite3VdbeMemToRowid()), OP_Eq, and OP_Copy, all of which are
+      ** already narrow-PK-safe as long as this register holds the correctly
+      ** typed value rather than truncated/zeroed bits. */
       sqlite3VdbeAddOp2(v, OP_Rowid, iDataCur, regOldRowid);
+      if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      }
       if( eOnePass==ONEPASS_OFF ){
         aRegIdx[nAllIdx] = ++pParse->nMem;
         sqlite3VdbeAddOp3(v, OP_Insert, iEph, regRowSet, regOldRowid);
@@ -858,7 +871,17 @@ void sqlite3Update(
                 v, OP_NotFound, iDataCur, labelContinue, iPk, nPk
             ); VdbeCoverage(v);
           }else{
+            /* Narrow-fixed-width-PK-as-rowid (README.md): iEph's own key is
+            ** bit-identical to pTab's real key (OP_Insert into iEph earlier
+            ** converted the same natural-typed value via
+            ** sqlite3VdbeMemToRowid()), so decoding it back needs the SAME
+            ** P4_TABLE=pTab treatment as reading directly from iDataCur --
+            ** it's not about which cursor is physically read, but which
+            ** table's encoding produced the bit pattern being read. */
             sqlite3VdbeAddOp2(v, OP_Rowid, iEph, regOldRowid);
+            if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+              sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+            }
             sqlite3VdbeAddOp3(
                 v, OP_NotExists, iDataCur, labelContinue, regOldRowid
             ); VdbeCoverage(v);
@@ -872,7 +895,14 @@ void sqlite3Update(
     }else{
       sqlite3VdbeAddOp2(v, OP_Rewind, iEph, labelBreak); VdbeCoverage(v);
       labelContinue = sqlite3VdbeMakeLabel(pParse);
+      /* Narrow-fixed-width-PK-as-rowid (README.md): same reasoning as the
+      ** other OP_Rowid,iEph site above -- iEph's key bits were produced by
+      ** encoding a pTab-typed value, so decoding them needs P4_TABLE=pTab
+      ** even though the cursor being read here is the ephemeral table. */
       addrTop = sqlite3VdbeAddOp2(v, OP_Rowid, iEph, regOldRowid);
+      if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+        sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      }
       VdbeCoverage(v);
       sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, labelContinue, regOldRowid);
       VdbeCoverage(v);
@@ -891,7 +921,18 @@ void sqlite3Update(
     }else{
       sqlite3VdbeAddOp3(v, OP_Column, iEph, iRowidExpr, regNewRowid);
     }
-    sqlite3VdbeAddOp1(v, OP_MustBeInt, regNewRowid); VdbeCoverage(v);
+    /* Narrow-fixed-width-PK-as-rowid (README.md): OP_MustBeInt forces a
+    ** numeric-only rowid, which is wrong when pTab's rowid alias is a
+    ** BLOB/TEXT/REAL column -- regNewRowid may legitimately hold that
+    ** column's natural type here, exactly as insert.c's regRowid does
+    ** (see its bClassicIntRowid guard). Every downstream consumer of
+    ** regNewRowid (sqlite3GenerateConstraintChecks()'s IPK uniqueness
+    ** check, OP_Insert, OP_NotExists) already dispatches on the Mem's own
+    ** flags via sqlite3VdbeMemToRowid(), so simply skipping this coercion
+    ** is sufficient -- there is nothing else to convert it to here. */
+    if( (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))==0 ){
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, regNewRowid); VdbeCoverage(v);
+    }
   }
 
   /* Compute the old pre-UPDATE content of the row being changed, if that
