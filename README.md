@@ -275,18 +275,38 @@ forward, with step 1 already done.
      type string (`BLOB(8)`, `TEXT(4)`, `REAL`) for a qualifying narrow-PK column, unchanged from
      what an ordinary column of that declared type would show — nothing about the rowid-aliasing
      internals leaks into the declared-type string.
+10. **Secondary indexes on a narrow-PK table (scoped 2026-08-24, not started).** Step 7 discovered
+    that a narrow-PK table combined with any secondary index or `UNIQUE` constraint silently
+    corrupted data, and refused the combination outright as a stopgap. Root cause: every index
+    b-tree entry's trailing "rowid" field is required, by `sqlite3VdbeIdxRowid()`, to be a plain
+    classic-integer record serial type — but `insert.c`'s index-key-construction code
+    (`OP_IntCopy`) blindly assumes the source register already holds one, which is false for a
+    narrow-PK table's decoded `BLOB`/`TEXT`/`REAL` value. Scoped as two stages (full technical
+    writeup, including exact call sites and the reasoning for each design choice, is in the
+    project's design memory):
+    - **Step 10a (≤8-byte narrow-PK, no on-disk format change, works in both build configs).** The
+      raw `rowid_t` bits for a narrow-PK width up to 8 bytes already fit a normal 64-bit integer
+      serial type — `insert.c` just needs to actually perform that conversion instead of blindly
+      copying. Also needs reinstating (and extending to `OP_IdxRowid`) the `P4_TABLE`-decode
+      mechanism already proven for `OP_Rowid` in steps 5–8, at each `OP_IdxRowid` consumer
+      (`where.c`'s covering-index cursor-translation rewrite, `pragma.c`'s `integrity_check`,
+      `upsert.c`), plus relaxing step 7's two `CREATE TABLE`/`CREATE INDEX` guards to be conditional
+      on `pTab->pKeyWidth` rather than an unconditional refusal. Recommended to implement first: it
+      covers the overwhelmingly common case (any `BLOB`/`TEXT` primary key up to 8 bytes) with no
+      format change at all.
+    - **Step 10b (9–16-byte narrow-PK, `SQLITE_128BIT_ROWID`-only, genuine on-disk format change).**
+      A 9–16-byte `rowid_t` cannot fit any existing integer serial type, so this stage repurposes
+      record serial type 11 — confirmed reserved and completely unused anywhere in this codebase or
+      by mainline SQLite (unlike type 10, which already has a real meaning: the
+      `sqlite3_vtab_nochange()` marker) — as a new, self-describing, fixed 16-byte field holding the
+      raw `rowid_t` verbatim (no order-preserving transform needed, since this field is provably
+      never used as a sort key — `sqlite3VdbeIdxKeyCompare()` already ignores it). No new page-1
+      format-version gating is needed: a >8-byte narrow-PK table can only already exist in a file
+      with the wide-rowid magic header set (per step 2's own width-cap validation), so type 11's
+      usage automatically inherits that existing gate.
 
 ## 4. Potential follow-up work
 
-- **Secondary indexes on a narrow-PK table.** Currently refused outright (see step 7) because every
-  index b-tree entry's trailing rowid field is a plain `INTEGER` in SQLite's on-disk format, which a
-  narrow-PK `rowid_t` cannot in general populate correctly. **Scoped, 2026-08-24 (design memory has
-  the full writeup; not started)** as two stages: **step 10a**, a real `BLOB`/`TEXT`/`REAL`-aware
-  conversion at index-key-construction time for the ≤8-byte case (the raw `rowid_t` bits *do* fit in
-  a 64-bit integer field, just not via the identity mapping `OP_IntCopy` assumes today) — no format
-  change, works in both build configs, recommended first since it covers the overwhelmingly common
-  case; and **step 10b**, a genuine on-disk format change (repurposing the reserved-and-unused record
-  serial type 11 as a fixed 16-byte field) for the `SQLITE_128BIT_ROWID`-only 9–16-byte case.
 - **Type-spelling synonyms.** Only exact `BLOB`/`TEXT`/`REAL` qualify today; `CHAR`/`VARCHAR`/
   `NCHAR`/`NVARCHAR`/`CLOB` (text-like) and `DOUBLE`/`FLOAT`/`DOUBLE PRECISION` (real-like) are
   deliberately out of scope for the initial implementation. Follow-up: either extend eligibility to
