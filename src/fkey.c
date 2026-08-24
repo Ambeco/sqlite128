@@ -358,20 +358,31 @@ static void fkLookupParent(
   if( isIgnore==0 ){
     if( pIdx==0 ){
       /* If pIdx is NULL, then the parent key is the INTEGER PRIMARY KEY
-      ** column of the parent table (table pTab).  */
+      ** column of the parent table (table pTab). Narrow-fixed-width-PK-as-
+      ** rowid (README.md): a qualifying BLOB/TEXT/REAL rowid alias also
+      ** takes this pIdx==0 branch (it gets no index either, same as
+      ** INTEGER PRIMARY KEY) -- bClassicIntParentKey distinguishes the two
+      ** so OP_MustBeInt (meaningless, and actively wrong, for a non-
+      ** INTEGER rowid alias) is only emitted for the classic case. */
       int iMustBeInt;               /* Address of MustBeInt instruction */
       int regTemp = sqlite3GetTempReg(pParse);
-  
-      /* Invoke MustBeInt to coerce the child key value to an integer (i.e. 
+      int bClassicIntParentKey = (pTab->tabFlags &
+          (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))==0;
+
+      /* Invoke MustBeInt to coerce the child key value to an integer (i.e.
       ** apply the affinity of the parent key). If this fails, then there
       ** is no matching parent key. Before using MustBeInt, make a copy of
       ** the value. Otherwise, the value inserted into the child key column
       ** will have INTEGER affinity applied to it, which may not be correct.  */
-      sqlite3VdbeAddOp2(v, OP_SCopy, 
+      sqlite3VdbeAddOp2(v, OP_SCopy,
         sqlite3TableColumnToStorage(pFKey->pFrom,aiCol[0])+1+regData, regTemp);
-      iMustBeInt = sqlite3VdbeAddOp2(v, OP_MustBeInt, regTemp, 0);
-      VdbeCoverage(v);
-  
+      if( bClassicIntParentKey ){
+        iMustBeInt = sqlite3VdbeAddOp2(v, OP_MustBeInt, regTemp, 0);
+        VdbeCoverage(v);
+      }else{
+        iMustBeInt = 0;
+      }
+
       /* If the parent table is the same as the child table, and we are about
       ** to increment the constraint-counter (i.e. this is an INSERT operation),
       ** then check if the row being inserted matches itself. If so, do not
@@ -380,12 +391,12 @@ static void fkLookupParent(
         sqlite3VdbeAddOp3(v, OP_Eq, regData, iOk, regTemp); VdbeCoverage(v);
         sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
       }
-  
+
       sqlite3OpenTable(pParse, iCur, iDb, pTab, OP_OpenRead);
       sqlite3VdbeAddOp3(v, OP_NotExists, iCur, 0, regTemp); VdbeCoverage(v);
       sqlite3VdbeGoto(v, iOk);
       sqlite3VdbeJumpHere(v, sqlite3VdbeCurrentAddr(v)-2);
-      sqlite3VdbeJumpHere(v, iMustBeInt);
+      if( bClassicIntParentKey ) sqlite3VdbeJumpHere(v, iMustBeInt);
       sqlite3ReleaseTempReg(pParse, regTemp);
     }else{
       int nCol = pFKey->nCol;

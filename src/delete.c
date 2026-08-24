@@ -317,11 +317,19 @@ void sqlite3DeleteFrom(
   i16 nKey;              /* Number of memory cells in the row key */
   int iEphCur = 0;       /* Ephemeral table holding all primary key values */
   int iRowSet = 0;       /* Register for rowset of rows to delete */
+  int regEphData = 0;    /* Data register for the narrow-PK two-pass FIFO */
   int addrBypass = 0;    /* Address of jump over the delete logic */
   int addrLoop = 0;      /* Top of the delete loop */
   int addrEphOpen = 0;   /* Instruction to open the Ephemeral table */
   int bComplex;          /* True if there are triggers or FKs or
                          ** subqueries in the WHERE clause */
+  int bNarrowPk;         /* Narrow-fixed-width-PK-as-rowid (README.md): true
+                         ** if pTab's rowid alias is a BLOB/TEXT/REAL column
+                         ** -- RowSet only holds plain 64-bit integers, so the
+                         ** two-pass rowid FIFO below must use an ephemeral
+                         ** table instead (same mechanism as update.c's own
+                         ** two-pass FIFO), exactly like the WITHOUT ROWID
+                         ** (pPk) case already does. */
 
 #ifndef SQLITE_OMIT_TRIGGER
   int isView;                  /* True if attempting to delete from a view */
@@ -344,6 +352,7 @@ void sqlite3DeleteFrom(
   */
   pTab = sqlite3SrcListLookup(pParse, pTabList);
   if( pTab==0 )  goto delete_from_cleanup;
+  bNarrowPk = (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0;
 
   /* Figure out if we have any triggers and if the table being
   ** deleted from is a view
@@ -497,11 +506,19 @@ void sqlite3DeleteFrom(
     if( sNC.ncFlags & NC_Subquery ) bComplex = 1;
     wcf |= (bComplex ? 0 : WHERE_ONEPASS_MULTIROW);
     if( HasRowid(pTab) ){
-      /* For a rowid table, initialize the RowSet to an empty set */
       pPk = 0;
       assert( nPk==1 );
-      iRowSet = ++pParse->nMem;
-      sqlite3VdbeAddOp2(v, OP_Null, 0, iRowSet);
+      if( bNarrowPk ){
+        regEphData = ++pParse->nMem;
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regEphData);
+        iEphCur = pParse->nTab++;
+        addrEphOpen = sqlite3VdbeAddOp3(v, OP_OpenEphemeral, iEphCur, 0,
+                                         regEphData);
+      }else{
+        /* For a rowid table, initialize the RowSet to an empty set */
+        iRowSet = ++pParse->nMem;
+        sqlite3VdbeAddOp2(v, OP_Null, 0, iRowSet);
+      }
     }else{
       /* For a WITHOUT ROWID table, create an ephemeral table used to
       ** hold all primary keys for rows to be deleted. */
@@ -576,6 +593,10 @@ void sqlite3DeleteFrom(
         sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, nPk, iKey,
             sqlite3IndexAffinityStr(pParse->db, pPk), nPk);
         sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iEphCur, iKey, iPk, nPk);
+      }else if( bNarrowPk ){
+        /* Add the rowid of the row to be deleted to the ephemeral FIFO */
+        nKey = 1;  /* OP_DeferredSeek always uses a single rowid */
+        sqlite3VdbeAddOp3(v, OP_Insert, iEphCur, regEphData, iKey);
       }else{
         /* Add the rowid of the row to be deleted to the RowSet */
         nKey = 1;  /* OP_DeferredSeek always uses a single rowid */
@@ -622,11 +643,22 @@ void sqlite3DeleteFrom(
         sqlite3VdbeAddOp2(v, OP_RowData, iEphCur, iKey);
       }
       assert( nKey==0 );  /* OP_Found will use a composite key */
+    }else if( bNarrowPk ){
+      /* Read the rowid back out of the ephemeral FIFO, decoding it via the
+      ** same P4_TABLE mechanism as step 5's SELECT read-back and step 7's
+      ** update.c FIFO -- the ephemeral table's stored key is bit-identical
+      ** to pTab's real key (OP_Insert above encoded the same natural-typed
+      ** value pTab's own key would), so it decodes correctly regardless of
+      ** which physical cursor is being read. */
+      addrLoop = sqlite3VdbeAddOp1(v, OP_Rewind, iEphCur); VdbeCoverage(v);
+      sqlite3VdbeAddOp2(v, OP_Rowid, iEphCur, iKey);
+      sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      assert( nKey==1 );
     }else{
       addrLoop = sqlite3VdbeAddOp3(v, OP_RowSetRead, iRowSet, 0, iKey);
       VdbeCoverage(v);
       assert( nKey==1 );
-    } 
+    }
  
     /* Delete the row */
 #ifndef SQLITE_OMIT_VIRTUALTABLE
@@ -655,13 +687,13 @@ void sqlite3DeleteFrom(
     if( eOnePass!=ONEPASS_OFF ){
       sqlite3VdbeResolveLabel(v, addrBypass);
       sqlite3WhereEnd(pWInfo);
-    }else if( pPk ){
+    }else if( pPk || bNarrowPk ){
       sqlite3VdbeAddOp2(v, OP_Next, iEphCur, addrLoop+1); VdbeCoverage(v);
       sqlite3VdbeJumpHere(v, addrLoop);
     }else{
       sqlite3VdbeGoto(v, addrLoop);
       sqlite3VdbeJumpHere(v, addrLoop);
-    }    
+    }
   } /* End non-truncate path */
 
   /* Update the sqlite_sequence table by storing the content of the

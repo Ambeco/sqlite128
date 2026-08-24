@@ -225,9 +225,31 @@ forward, with step 1 already done.
    compatible indexed `PRIMARY KEY` instead of silently corrupting the database. This is a real,
    user-facing limitation of the feature as it stands (no secondary indexes on a narrow-PK table)
    that a future step would need to lift.
-8. **Foreign-key verification (not started).** Confirm `fkey.c` correctly handles a parent table
-   using one of the new rowid kinds — this is the feature's original motivating use case (a UUID
-   primary key referenced by a foreign key).
+8. **Foreign-key verification (done).** `fkey.c`'s child-side existence check (the `pIdx==0` branch,
+   taken for a narrow-PK parent exactly as it is for `INTEGER PRIMARY KEY`, since a qualifying
+   narrow-PK column gets no index either) now skips `OP_MustBeInt` for a narrow-PK parent, mirroring
+   `insert.c`'s `bClassicIntRowid` guard. Verified: child-row insert/delete against a narrow-PK
+   parent, `ON DELETE`/`ON UPDATE CASCADE` across a narrow-PK parent (including a genuine 16-byte
+   `BLOB` under `SQLITE_128BIT_ROWID`), and multi-row cascades.
+   **Major pre-existing gap discovered and fixed by this step (not FK-specific in root cause, but
+   found here because FK enforcement is what forced it into the open):** `delete.c`'s two-pass
+   `DELETE` strategy (`ONEPASS_OFF` — used whenever the statement has a trigger, a required FK check,
+   or a subquery in the `WHERE` clause; FK enforcement on almost any narrow-PK table trips this)
+   collects the rowids of matching rows into a `RowSet` before deleting them. `RowSet` only stores
+   plain 64-bit integers (`OP_RowSetAdd`/`OP_RowSetRead` assert and read `Mem.u.i` directly) — wrong
+   for a narrow-PK table's decoded `BLOB`/`TEXT`/`REAL` rowid value, and never even attempted a
+   fallback: it silently inserted garbage into the set, causing the delete loop to match zero rows.
+   The practical effect: **any `DELETE` against a narrow-PK table that had a trigger, that touched a
+   table with `PRAGMA foreign_keys=ON` and an FK relationship, or whose `WHERE` clause contained a
+   subquery, silently deleted nothing at all** (`changes()` reported 0, no error). Fixed by giving
+   `delete.c` a `bNarrowPk`-gated alternate path that uses an ephemeral table for the two-pass rowid
+   FIFO instead of a `RowSet` — the exact same mechanism `update.c` already uses for its own two-pass
+   FIFO (§7), including the same "decode needs `P4_TABLE=pTab` even though the physical cursor being
+   read is the ephemeral table, not the real one" reasoning. Verified: `DELETE` with an ordinary
+   `AFTER`/`BEFORE` trigger present, `DELETE ... WHERE col IN (SELECT ...)`, multi-row cascades, and
+   the full regression suite under both a default and a `SQLITE_128BIT_ROWID` build (only the two
+   known/expected failures) — including `delete.test`/`fkey1-4.test`, which exercise the classic
+   `RowSet` path heavily and confirmed it is untouched for ordinary `INTEGER PRIMARY KEY` tables.
 9. **Remaining edge cases (not started).** Reject `AUTOINCREMENT` combined with a non-`INTEGER` PK
    kind; confirm `WITHOUT ROWID` tables and composite primary keys stay excluded; verify
    `PRAGMA table_info` and similar introspection keep reporting the column's original declared
