@@ -41,14 +41,14 @@ right fixed width and type at runtime:
 
 | Type | Required constraints |
 |---|---|
-| `BLOB(W)`, W≤max | `NOT NULL`, `CHECK(typeof(col)='blob')`, `CHECK(length(col)=W)` |
-| `TEXT(W)`, W≤max | `NOT NULL`, `CHECK(typeof(col)='text')`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
+| `BLOB(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='blob')`, `CHECK(length(col)=W)` |
+| `TEXT(W)`, W≤16 | `NOT NULL`, `CHECK(typeof(col)='text')`, `CHECK(length(CAST(col AS BLOB))=W)`, and effective collation must resolve to `BINARY` (the default, unless overridden) |
 | `REAL` | `NOT NULL`, `CHECK(typeof(col)='real')` |
 
-Where max is 8 bytes in a default build and 16 bytes under `SQLITE_128BIT_ROWID` — a default
-build's rowid is still a plain 64-bit integer (only `SQLITE_128BIT_ROWID` widens it to 128 bits),
-so only widths that actually fit are ever accepted. `REAL` is always exactly 8 bytes and qualifies
-under either build.
+The 16-byte cap only applies under `SQLITE_128BIT_ROWID`; in a default build the effective cap is 8
+bytes, since a default build's rowid is still a plain 64-bit integer (only `SQLITE_128BIT_ROWID`
+widens it to 128 bits) and only widths that actually fit are ever accepted. `REAL` is always exactly
+8 bytes and qualifies under either build.
 
 This mirrors, deliberately, how `INTEGER PRIMARY KEY` itself already works in mainline SQLite: it's
 spelling-sensitive (`INT PRIMARY KEY` does *not* get rowid-aliasing, only literally `INTEGER`
