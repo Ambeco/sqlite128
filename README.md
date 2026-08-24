@@ -250,10 +250,31 @@ forward, with step 1 already done.
    the full regression suite under both a default and a `SQLITE_128BIT_ROWID` build (only the two
    known/expected failures) — including `delete.test`/`fkey1-4.test`, which exercise the classic
    `RowSet` path heavily and confirmed it is untouched for ordinary `INTEGER PRIMARY KEY` tables.
-9. **Remaining edge cases (not started).** Reject `AUTOINCREMENT` combined with a non-`INTEGER` PK
-   kind; confirm `WITHOUT ROWID` tables and composite primary keys stay excluded; verify
-   `PRAGMA table_info` and similar introspection keep reporting the column's original declared
-   type.
+9. **Remaining edge cases (done, verification only — no code changes needed).** All three items
+   turned out to already be correctly handled by step 2's original design, each for a distinct
+   reason:
+   - `AUTOINCREMENT` combined with a `BLOB`/`TEXT`/`REAL` PK: `sqlite3AddPrimaryKey()`'s
+     narrow-PK-candidate branch is an `else if` reached only when the pre-existing (unmodified)
+     `else if(autoInc){ sqlite3ErrorMsg(pParse, "AUTOINCREMENT is only allowed on an INTEGER PRIMARY
+     KEY"); }` check has already NOT fired — i.e. this is exactly mainline SQLite's decades-old
+     `AUTOINCREMENT`-requires-`INTEGER PRIMARY KEY` restriction, completely undisturbed by this
+     feature's code being appended after it. Verified for all three kinds (`BLOB`/`TEXT`/`REAL`),
+     with and without otherwise-qualifying `CHECK`/width constraints present.
+   - `WITHOUT ROWID` tables and composite (multi-column) primary keys: the narrow-PK-candidate branch
+     requires `nTerm==1` (single-column PK) checked before the `WITHOUT ROWID` flag is even
+     available, and `narrowPKFinalize()` separately bails out via `bWithoutRowid` — both explicit
+     opt-outs from step 2's original design (see the design memory's near-miss trigger definition),
+     not something that needed step 9 to add. Verified: a `WITHOUT ROWID` table with a
+     `BLOB(8)`-shaped single-column PK has no `rowid` pseudo-column (genuinely without rowid, not
+     silently rowid-aliased); a composite `PRIMARY KEY(x,y)` with a `BLOB(16)`-shaped `x` allows
+     duplicate `x` values with distinct `y` (proving `x` alone isn't being enforced as a unique rowid
+     alias). Also verified `PRIMARY KEY DESC` on an otherwise-qualifying column falls back to an
+     ordinary indexed PK (the `sortOrder!=SQLITE_SO_DESC` guard), with uniqueness correctly enforced
+     via the ordinary index rather than the narrow-PK rowid mechanism.
+   - `PRAGMA table_info` introspection: verified it reports the column's exact original declared
+     type string (`BLOB(8)`, `TEXT(4)`, `REAL`) for a qualifying narrow-PK column, unchanged from
+     what an ordinary column of that declared type would show — nothing about the rowid-aliasing
+     internals leaks into the declared-type string.
 
 ## 4. Potential follow-up work
 
