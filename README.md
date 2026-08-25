@@ -457,15 +457,45 @@ forward, with step 1 already done.
 
 ## 5. Known bugs
 
-Confirmed, reproducible bugs under `SQLITE_128BIT_ROWID`, found via a dedicated audit pass (not
-part of the numbered step-by-step plan in §3, and not speculative follow-up work like §4 — these are
-concrete, verified defects). Kept separate and explicit so they aren't lost track of. None of these
-affect a default (non-`SQLITE_128BIT_ROWID`) build. §5a (this fork's own narrow-PK bugs) is fully
-fixed; §5b (pre-existing foundation bugs, unrelated to narrow-PK) has its two most impactful bugs
-fixed (2026-08-25) — see §5b's own subsections for what's fixed vs. still open, and a triage-based
+Confirmed, reproducible bugs, found via dedicated audit passes (not part of the numbered
+step-by-step plan in §3, and not speculative follow-up work like §4 — these are concrete, verified
+defects). Kept separate and explicit so they aren't lost track of. §5b (pre-existing
+`SQLITE_128BIT_ROWID` foundation bugs, unrelated to narrow-PK) does not affect a default build; §5a
+has one open item that does (see below — it's a narrow-PK-heuristic bug, not width/build-specific).
+§5a's step-11 batch is fixed; one further bug was found afterward and remains open. §5b has its two
+most impactful bugs fixed (2026-08-25) — see §5b's own subsections for what's fixed vs. still open,
+and a triage-based
 plan for the rest.
 
-### 5a. Narrow-PK feature bugs (this fork's own code) — all fixed (step 11)
+### 5a. Narrow-PK feature bugs (this fork's own code)
+
+#### Open
+
+- **The near-miss heuristic fires on any width-annotated `PRIMARY KEY` column, even with zero other
+  narrow-PK signal, breaking ordinary schemas that were never attempting narrow-PK at all.**
+  `build.c`'s `narrowPKFinalize()` seeds `hasSignal` from `strchr(zRaw, '(')!=0` — true for *any*
+  declared type with a width annotation (`TEXT(36)`, `VARCHAR(50)`, etc.), independent of whether any
+  `CHECK` constraint mentioning the column exists at all. `TEXT(N)`/`VARCHAR(N)`-style width
+  annotations on a `PRIMARY KEY` column are an extremely common, ordinary, mainline-compatible SQL
+  pattern (routine in schemas ported from other databases) that SQLite has always accepted and
+  silently ignored the width of — this fork now rejects them outright unless the user adds narrow-PK
+  `CHECK` constraints they never asked for, or strips schema-documentation width information they may
+  want to keep. Found via `mdevtest`'s `test/tkt1449.test` (a real historical mainline regression
+  test, `TQUNID text(36) not null ... primary key`) failing outright — proven fork-introduced, not
+  pre-existing, by building a pristine pre-fork worktree (commit `13bcd6f6b`, the parent of this
+  fork's first commit) and confirming it passes there cleanly (0 errors) while the current tree
+  fails both `tkt1449-1.1` and `tkt1449-1.2`. Minimal repro:
+  `CREATE TABLE t(id text(36) not null primary key, v text)` — no `CHECK` at all — raises "looks
+  like an attempt at a narrow rowid-optimized primary key... missing CHECK(typeof(id)='text')".
+  Not yet fixed. Likely fix direction: `hasSignal` should require an actual narrow-PK-shaped `CHECK`
+  constraint (a `narrowPKMatchLengthEq`/`narrowPKMatchTypeofEq`/`narrowPKExprMentionsColumn` hit —
+  the other three ways `hasSignal` can already become true) rather than a bare width annotation on
+  the declared type; needs care around what that does to the *intentional* near-miss cases the
+  `strchr` check was presumably added to catch (a width-only declaration with no `CHECK` at all was
+  apparently treated as "clearly attempting narrow-PK" — worth understanding why before just deleting
+  the check).
+
+#### Fixed (step 11)
 
 Step 5 flagged that `rowidTruncateToI64()` — used, unchanged, at every `OP_Rowid` call site that
 doesn't carry the `P4_TABLE` tag — takes the LOW 64 bits of a `rowid_t`, which is the wrong half for
