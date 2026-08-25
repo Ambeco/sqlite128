@@ -1133,7 +1133,35 @@ static SQLITE_INLINE void rowidToNarrowBytes(rowid_t x, u8 *aOut, int nByte){
 **     makes this correct -- -0.0's raw bit pattern otherwise has its
 **     sign bit set despite being numerically non-negative, which would
 **     otherwise wrongly route it through the negative-number transform
-**     and land it far away from +0.0's canonical value).
+**     and land it far away from +0.0's canonical value). One side effect:
+**     rowidToReal() always decodes rowid_t 0 back to +0.0, never -0.0 --
+**     a narrow-PK REAL column that was inserted as -0.0 reads back as
+**     +0.0. This loses the sign-of-zero bit (unlike an ordinary REAL
+**     column, which round-trips it exactly), but is required (one
+**     b-tree key can't decode to two different values) and is harmless
+**     for ordering (+0.0 and -0.0 are already order-equivalent).
+**   - +Inf/-Inf need no special case: their bit patterns (exponent all-1,
+**     mantissa 0) are the largest-magnitude non-NaN patterns, so the
+**     ordinary positive/negative handling above already sorts them as
+**     the max/min REAL, respectively. Subnormals likewise need no
+**     special case -- IEEE-754's raw-bit-monotonic property, which this
+**     whole transform relies on, already holds for them.
+**   - NaN (either sign) is NOT specifically handled, and the transform
+**     above does not give it a consistent or meaningful order (a +NaN
+**     would sort above +Inf; a -NaN, having a set sign bit that this
+**     code never flips because r<0.0 and r==0.0 are both false for NaN,
+**     would land as an unremarkable negative value, not even ordered
+**     consistently relative to +NaN or to -Inf). This is deliberately
+**     not worth handling: NaN can never actually reach this function.
+**     sqlite3VdbeMemSetDouble() -- the only path that ever sets MEM_Real
+**     from a computed value -- converts NaN to NULL instead, and
+**     sqlite3VdbeSerialGet7() does the same when reading a REAL back off
+**     disk, so a Mem's u.r is never NaN in the first place. A narrow-PK
+**     REAL column is also declared NOT NULL, and typeof(NaN) is 'null',
+**     so a would-be-NaN value fails that constraint independently of
+**     the above. See the "how does SQLite order NaN" conversation in
+**     project history for the full reasoning if this ever needs
+**     revisiting.
 */
 static SQLITE_INLINE rowid_t rowidFromReal(double r){
   u64 u;
