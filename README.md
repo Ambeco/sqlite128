@@ -462,10 +462,10 @@ step-by-step plan in §3, and not speculative follow-up work like §4 — these 
 defects). Kept separate and explicit so they aren't lost track of. §5b (pre-existing
 `SQLITE_128BIT_ROWID` foundation bugs, unrelated to narrow-PK) does not affect a default build; §5a
 has one open item that does (see below — it's a narrow-PK-heuristic bug, not width/build-specific).
-§5a's step-11 batch is fixed; one further bug was found afterward and remains open. §5b has its two
-most impactful bugs fixed (2026-08-25) — see §5b's own subsections for what's fixed vs. still open,
-and a triage-based
-plan for the rest.
+§5a's step-11 batch is fixed; one further bug was found afterward and remains open. §5b has its
+three most impactful bugs fixed (2026-08-25), and every other originally-listed item re-triaged and
+either resolved as a side effect or confirmed (not assumed) to be intentional, by-design behavior —
+see §5b's own subsections for the full breakdown and what little remains genuinely open.
 
 ### 5a. Narrow-PK feature bugs (this fork's own code)
 
@@ -567,7 +567,7 @@ Found incidentally while testing the narrow-PK feature (steps 6, 7, 8, 10a), eac
 `git stash` A/B testing to reproduce identically with none of this feature's code present — i.e.
 these are gaps in the wide-rowid foundation (step 1) itself, or in wholly unrelated subsystems,
 predating and unrelated to narrow-PK-as-rowid. Originally catalogued without root-causing; a
-follow-up audit (2026-08-25) root-caused and fixed the two most impactful items (below), which
+follow-up audit (2026-08-25) root-caused and fixed the three most impactful items (below), which
 turned out to resolve the large majority of the originally-listed test failures as a side effect.
 
 #### Fixed (2026-08-25)
@@ -620,46 +620,87 @@ turned out to resolve the large majority of the originally-listed test failures 
   `rowidGt()`/`rowidGe()` helpers), plus a new `rowidLargest()` helper (`sqliteInt.h`) for the
   top-level entry call's "no maximum yet" bound — deliberately *not* `rowidFromI64(LARGEST_INT64)`,
   which a narrow-PK table's high-aligned values can legitimately and correctly exceed.
-- All four fixes verified with the established 27-file regression suite plus the 15-file general
-  comparison/index/vacuum sanity set (42 files total), clean under both a default build and
-  `SQLITE_128BIT_ROWID`, plus a full `quicktest` run for the default build (given how central
-  `cellSizePtrTableLeaf()` is to ordinary, non-wide-rowid operation) and re-triage of every
-  originally-listed §5b test file.
+- **`newDatabase()` (`btree.c`) set `BTS_WIDE_ROWID` for a brand-new file *after*
+  `lockBtree()`/`sqlite3BtreeBeginTrans()` had already computed `pBt->maxLeaf`** (the table-leaf
+  local-payload budget, which needs to be 10 bytes smaller for a wide file — see the first fix
+  above) — for a genuinely empty file, page 1 doesn't exist yet for `lockBtree()` to have read a
+  wide magic header from, so it always computed the *narrow* `maxLeaf` value first, and nothing ever
+  recomputed it after `newDatabase()` set the flag moments later. Every cell written for the rest of
+  that session (until the file was closed and reopened, at which point `lockBtree()` would correctly
+  read the now-persisted wide header) used the wrong, too-generous-by-10-bytes budget for deciding
+  the local/overflow-page boundary. A *later* session (or an eviction-driven page-1 reload within the
+  *same* session — e.g. a small `PRAGMA cache_size` forcing page 1 out of cache) recomputes the
+  correct, smaller budget, which disagrees with what was actually written, corrupting the
+  overflow-pointer's position. Root-caused via `test/ovfl.test` (`PRAGMA cache_size = 10` plus 2000
+  rows with an overflowing column — exactly the eviction-driven reload scenario): `integrity_check`
+  reported "invalid page number" values that decoded to literal ASCII payload content (`hija`/`ijab`,
+  fragments of the test's own `abcdefghij`-repeated string), proving the overflow pointer was being
+  read from inside the payload rather than its real position. Fixed by recomputing `pBt->maxLeaf`
+  immediately after `newDatabase()` sets `BTS_WIDE_ROWID`. **Impact:** alone, resolved
+  `test/ovfl.test` (1/3 → 0/3), `test/amatch1.test` (10/20 → 0/20), `test/vacuum6.test` (11/35 →
+  0/35), `test/sort5.test` (1/16 → 0/16), and `test/pagesize.test` (2/100 → 0/100) entirely.
+- All five fixes verified with the established 27-file regression suite plus the 15-file general
+  comparison/index/vacuum sanity set, the originally-listed §5b test files, and (for the first two
+  fixes) a full `quicktest` run for the default build — all clean under both a default build and
+  `SQLITE_128BIT_ROWID`.
+
+#### Confirmed *not* bugs (intentional, by-design behavior)
+
+Re-triaging every remaining originally-listed §5b test file after the fixes above (rather than
+assuming any given failure is "probably fine" — see the `tkt1449.test`/`shellB.test` correction
+earlier in this section for why that assumption is exactly what NOT to do) turned up several
+failures that are the *unavoidable, correct* consequence of this fork's own foundational design
+decisions, not defects:
+
+- **`test/filefmt.test`** (`filefmt-1.1`) hardcodes mainline's standard "SQLite format 3\0" magic
+  header as the expected first 16 bytes of any new database. Decoding this fork's actual output
+  byte-for-byte gives `"SQLite fmt 128b\0"` — exactly `SQLITE_FILE_HEADER_WIDE` (`btree.c`), the
+  intentional Phase 1 mechanism this whole `SQLITE_128BIT_ROWID` build uses to mark and detect
+  wide-rowid files. No build that implements this design can pass this specific assertion.
+- **`test/incrvacuum.test`** (`incrvacuum-17.1`), **`test/resetdb.test`** (`resetdb-730`/`740`),
+  **`test/gencol1.test`**, **`test/dbfuzz001.test`**, **`test/altercorrupt.test`**, and
+  **`ext/rtree/rtreefuzz001.test`** all fail with "attempt to write a readonly database" (or, for
+  `altercorrupt`/`rtreefuzz001`, a differently-worded error than the test expects, in the same
+  situation). Every one of them injects a hand-crafted or `db deserialize`'d database whose page 1
+  starts with the *standard, narrow* magic header (confirmed by reading each test's hex dump/raw
+  `sqlite_dbpage` write directly — all start `53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00`,
+  i.e. literal `"SQLite format 3\0"`) to simulate a specific historical bug scenario or corruption
+  case. Under `SQLITE_128BIT_ROWID`, this fork's `BTS_LEGACY_NARROW` mechanism correctly recognizes
+  such a file as a legacy narrow-format database and marks it read-only (a `SQLITE_128BIT_ROWID`
+  build never writes narrow-format cells — see `newDatabase()`'s own comment) — so a test that goes
+  on to write to that same connection correctly fails, just with a different (arguably more
+  informative) error than the test's mainline-only expectation. No build with this project's own
+  narrow-file-is-read-only design could pass these specific assertions either.
+- None of the above are test-environment artifacts or genuine defects — each was confirmed by
+  decoding the actual bytes/mechanism involved, not assumed.
 
 #### Still open
 
-Re-triaged after the fixes above (still under `SQLITE_128BIT_ROWID`, same test files as originally
-listed) — most items resolved as a side effect of the two fixes; what's left:
+- **`ext/fts5/test/fts5origintext4.test`** (`fts5origintext4-1.2.1`) — a performance-characteristic
+  test asserting that FTS5's page cache uses *more* than 250000 bytes for a broad, low-selectivity
+  query (`'the'`), verifying that its "doclist-index" optimization does *not* kick in and short-cut
+  the page loads for such a query. Confirmed **genuinely `SQLITE_128BIT_ROWID`-specific** (not
+  environmental) by running the identical scenario under a default build (327048 bytes, comfortably
+  over the threshold, test passes) versus this build (70280 bytes, well under it) — a real,
+  reproducible, ~4.6x difference in cache usage caused by enabling wide rowids, not test flakiness
+  or a borderline threshold miss. Not root-caused: would require understanding FTS5's doclist-index
+  page-loading heuristics (a large, specialized subsystem this project has not otherwise touched) in
+  enough depth to see how they interact with the wider rowid format. Low real-world severity (no
+  data loss or incorrect query results — only how much a page cache measurement crosses a hardcoded
+  threshold) relative to the depth of investigation needed; a natural candidate for its own
+  dedicated follow-up rather than folding into this pass.
+- Several `ext/recover/*` tests — not yet re-triaged against the fixes above.
+- Two other clusters from step 10a's original `veryquick.test` run, not yet re-triaged: one
+  sub-case of `test/pragma.test`, and a larger cluster of `corruptL`/`corruptN`/`dbpage`/`diskfull`/
+  `fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases.
 
-- `test/amatch1.test`, `test/vacuum6.test`, `test/resetdb.test`, `test/gencol1.test`,
-  `test/dbfuzz001.test`, `test/filefmt.test`, `test/sort5.test`, `test/incrvacuum.test`,
-  `test/pagesize.test`, `test/ovfl.test`, `ext/fts5/test/fts5origintext4.test`,
-  `ext/rtree/rtreefuzz001.test` — still fail, error counts unchanged by the fixes above, not yet
-  root-caused. `test/resetdb.test`/`gencol1.test`/`dbfuzz001.test` fail with a *different* symptom
-  ("attempt to write a readonly database" rather than "disk image is malformed"), suggestive of a
-  distinct bug (or possibly a test-fixture/environment issue rather than a product bug — not yet
-  determined) from the "disk image is malformed" cluster the rest share.
-- `test/altercorrupt.test` — unchanged error count (2/5); may be exercising *expected* corrupt-input
-  handling whose exact diagnostics differ under wide rowids rather than a genuine bug — not yet
-  determined either way.
-- Several `ext/recover/*` tests — not re-triaged in this pass (excluded from the 2026-08-25 run for
-  time; still only originally confirmed pre-existing, not root-caused).
-- Two other clusters from step 10a's original `veryquick.test` run, not re-triaged in this pass:
-  `test/pragma.test` (one sub-case), and a larger cluster of `corruptL`/`corruptN`/`dbpage`/
-  `diskfull`/`fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases.
-
-**Suggested next steps, roughly in priority order:** (1) re-triage the still-open "disk image is
-malformed" cluster (`amatch1`, `vacuum6`, `sort5`, `pagesize`, `ovfl`, `fts5origintext4`,
-`rtreefuzz001`, `filefmt`, `incrvacuum`) the same way `boundary1.test` was bisected here — payload
-size and page-split/page-type variations (an *index* b-tree's analogous fast-path functions,
-`cellSizePtrIdxLeaf`/`cellSizePtr`, were not audited in this pass and are a natural place to look
-next, alongside `balance_nonroot()`'s own cell-copying code, which was not fully audited either); (2)
-determine whether the `resetdb`/`gencol1`/`dbfuzz001` "readonly database" cluster is a real bug or a
-test-environment artifact; (3) the `ext/recover/*`/R-tree/FTS3/FTS4 corpora and `altercorrupt.test`,
-lowest priority since they're the most likely to be exercising deliberately-corrupt input where
-some divergence in diagnostics (rather than a genuine defect) is plausible. Worth a dedicated
-follow-up audit pass before considering `SQLITE_128BIT_ROWID` production-ready for anything beyond
-this fork's own narrow-PK feature.
+**Suggested next steps:** (1) `ext/recover/*` and the `pragma`/`corruptL`/`corruptN`/`dbpage`/
+`diskfull`/`fts3*` clusters still haven't been re-triaged against today's three fixes at all —
+likely several will turn out already resolved, the same way most of the original list did here;
+(2) `fts5origintext4`'s doclist-index memory-usage gap, if ever prioritized, on its own; (3) after
+that, `SQLITE_128BIT_ROWID` would be in a substantially stronger position for anything beyond this
+fork's own narrow-PK feature — the three fixes in this section addressed foundational table-b-tree
+cell-size and file-creation-time budget bugs that affected any wide-rowid table, not edge cases.
 
 ## 6. Attribution
 

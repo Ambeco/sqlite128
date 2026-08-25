@@ -3666,6 +3666,33 @@ static int newDatabase(BtShared *pBt){
   memcpy(data, zMagicHeaderWide, sizeof(zMagicHeaderWide));
   assert( sizeof(zMagicHeaderWide)==16 );
   pBt->btsFlags |= BTS_WIDE_ROWID;
+  /* lockBtree() (the caller's caller, sqlite3BtreeBeginTrans()) already
+  ** computed pBt->maxLeaf using whatever BTS_WIDE_ROWID state existed
+  ** BEFORE this function set it just above -- for a genuinely brand-new,
+  ** still-empty file (pBt->nPage==0, the only case reaching this point),
+  ** that's always "not yet set" (page 1 doesn't exist yet for lockBtree()
+  ** to have read a wide magic header from), so maxLeaf was left at its
+  ** NARROW value (missing the 10-byte wide-key-varint budget widening --
+  ** see lockBtree()'s own comment on this exact formula). Nothing ever
+  ** recomputed it afterward, so it stayed wrong for this connection's
+  ** entire remaining lifetime -- until the file was closed and reopened,
+  ** at which point lockBtree() would read the NOW-persisted wide magic
+  ** header and compute the correctly-adjusted value. Any table filled
+  ** entirely within the CREATING session (never closed/reopened
+  ** in between) got its cells' local-vs-overflow payload boundary
+  ** computed against the wrong (too-generous-by-10-bytes) budget; a
+  ** later session (or an eviction-driven page-1 reload within the SAME
+  ** session, e.g. after PRAGMA cache_size forces page 1 out of a tiny
+  ** cache) recomputes the correct, smaller budget, disagreeing with
+  ** what was actually written -- corrupting the overflow-pointer
+  ** boundary ("database disk image is malformed", confirmed via
+  ** test/ovfl.test: the "invalid page number" bytes integrity_check
+  ** reported decoded to literal ASCII payload content, proving the
+  ** overflow pointer was being read from inside the payload rather than
+  ** its real position). Recompute here, right after the flag actually
+  ** becomes true, so every cell in this session uses the same, correct
+  ** budget lockBtree() would compute for this file from now on. */
+  pBt->maxLeaf = (u16)(pBt->usableSize - 35 - 10);
 #else
   memcpy(data, zMagicHeader, sizeof(zMagicHeader));
   assert( sizeof(zMagicHeader)==16 );
