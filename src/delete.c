@@ -1048,7 +1048,28 @@ int sqlite3GenerateIndexKey(
     }
   }
   if( regOut ){
-    sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol, regOut);
+    Table *pTab = pIdx->pTable;
+    if( nCol==pIdx->nColumn
+     && (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0
+     && pTab->pKeyWidth>8
+    ){
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: nCol==
+      ** pIdx->nColumn means the trailing rowid slot is included (not
+      ** truncated away by prefixOnly above), and regBase+nCol-1 already
+      ** holds a raw-16-byte-blob (sqlite3ExprCodeLoadIndexColumn()'s own
+      ** width>8 handling, via OP_Rowid's P5 mode) rather than something
+      ** ordinary OP_MakeRecord classification could turn into this
+      ** fork's own type-11 field -- build the record over the real
+      ** columns only, then splice the type-11 field on, exactly as
+      ** insert.c's own index-key-construction loop does. */
+      int regPartial = sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol-1, regPartial);
+      sqlite3VdbeAddOp3(v, OP_IdxAppendRowid, regPartial, regBase+nCol-1,
+                         regOut);
+      sqlite3ReleaseTempReg(pParse, regPartial);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol, regOut);
+    }
   }
   sqlite3ReleaseTempRange(pParse, regBase, nCol);
   return regBase;

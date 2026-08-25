@@ -1331,16 +1331,17 @@ static void codeDeferredSeek(
     ** which branch is live) so vdbe.c's OP_DeferredSeek handler knows to
     ** re-embed the rowid it reads back from the index using this table's
     ** HIGH-aligned convention (rowidFromNarrowBytes()) rather than the
-    ** LOW-aligned one sqlite3VdbeIdxRowid() always assumes -- see its own
-    ** comment, and OP_IdxRowid's identical fixup earlier in the same
-    ** shared vdbe.c case, for the full explanation. A >8-byte-wide alias
-    ** can't reach this code at all: build.c refuses to let such a table
-    ** have any index (step 10b territory). KNOWN GAP: if a future change
-    ** ever makes both conditions true simultaneously (a narrow-PK table
-    ** read via the OR-subclause/right-join deferred-seek optimization),
-    ** this branch loses to the one above and the rowid fixup is skipped --
-    ** the P4 slot can only hold one of the two. */
-    assert( pIdx->pTable->pKeyWidth<=8 );
+    ** LOW-aligned one sqlite3VdbeIdxRowid() assumes for a <=8-byte-wide
+    ** alias -- see its own comment, and OP_IdxRowid's identical
+    ** width-aware fixup earlier in the same shared vdbe.c case, for the
+    ** full explanation (step 10b extended both to also correctly handle
+    ** a 9-16-byte-wide alias, whose sqlite3VdbeIdxRowid() read is already
+    ** the correct full rowid_t verbatim, no re-embedding needed). KNOWN
+    ** GAP: if a future change ever makes both conditions true
+    ** simultaneously (a narrow-PK table read via the OR-subclause/
+    ** right-join deferred-seek optimization), this branch loses to the
+    ** one above and the rowid fixup is skipped -- the P4 slot can only
+    ** hold one of the two. */
     sqlite3VdbeAppendP4(v, pIdx->pTable, P4_TABLE);
   }
 }

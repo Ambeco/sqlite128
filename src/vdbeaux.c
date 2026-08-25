@@ -3971,11 +3971,26 @@ u32 sqlite3VdbeSerialType(Mem *pMem, int file_format, u32 *pLen){
 
 /*
 ** The sizes for serial types less than 128
+**
+** Narrow-fixed-width-PK-as-rowid (README.md), step 10b: entry 11 is 16,
+** not 0 ("reserved for future use" in mainline SQLite) -- this fork
+** repurposes serial type 11 as a fixed 16-byte field holding a 9-16-byte
+** narrow-PK secondary index's trailing rowid pointer verbatim (see
+** OP_IdxAppendRowid in vdbe.c, sqlite3VdbeIdxRowid() below, and
+** sqlite3VdbeSerialGet()'s own case 11). Unconditional (not #ifdef
+** SQLITE_128BIT_ROWID-gated) for simplicity: a default build can never
+** legitimately produce a type-11 field (no code path can create a
+** >8-byte narrow-PK table there), so this only ever affects how a
+** corrupt/malicious/cross-build-written file's type-11 field gets
+** parsed there -- 16 is no less safe than 0 for that purpose, and
+** keeping one shared table simplifies every generic length-based caller
+** (sqlite3VdbeRecordUnpack(), comparison paths, etc.) uniformly across
+** both builds.
 */
 const u8 sqlite3SmallTypeSizes[128] = {
-        /*  0   1   2   3   4   5   6   7   8   9 */  
+        /*  0   1   2   3   4   5   6   7   8   9 */
 /*   0 */   0,  1,  2,  3,  4,  6,  8,  8,  0,  0,
-/*  10 */   0,  0,  0,  0,  1,  1,  2,  2,  3,  3,
+/*  10 */   0, 16,  0,  0,  1,  1,  2,  2,  3,  3,
 /*  20 */   4,  4,  5,  5,  6,  6,  7,  7,  8,  8,
 /*  30 */   9,  9, 10, 10, 11, 11, 12, 12, 13, 13,
 /*  40 */  14, 14, 15, 15, 16, 16, 17, 17, 18, 18,
@@ -4096,10 +4111,33 @@ void sqlite3VdbeSerialGet(
       pMem->u.nZero = 0;
       return;
     }
-    case 11:   /* Reserved for future use */
     case 0: {  /* Null */
       /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
       pMem->flags = MEM_Null;
+      return;
+    }
+    case 11: {
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: 16 raw
+      ** bytes, a 9-16-byte narrow-PK secondary index's trailing rowid
+      ** pointer field (see OP_IdxAppendRowid in vdbe.c). Decoded here as
+      ** an ordinary 16-byte BLOB (zero-copy, same convention as the
+      ** default: case below) rather than reconstructing a rowid_t --
+      ** this generic decode point has no Table to know which table the
+      ** value belongs to, and more importantly this field's actual
+      ** semantic meaning (a raw rowid_t, not a real column value) is
+      ** only ever needed by sqlite3VdbeIdxRowid()'s OWN dedicated,
+      ** bypass-this-function read path. Decoding as a plain BLOB here
+      ** still gives every GENERIC consumer (record comparison during a
+      ** b-tree seek/delete on a non-unique index, where this field is
+      ** the duplicate-key disambiguator and must compare consistently
+      ** with itself) the correct behavior for free: ordinary memcmp-style
+      ** blob comparison on the same raw bytes on both sides of any such
+      ** comparison (see sqlite3ExprCodeLoadIndexColumn()'s width>8
+      ** branch in expr.c, which produces this exact same 16-byte-blob
+      ** representation for a search key's trailing field). */
+      pMem->z = (char *)buf;
+      pMem->n = 16;
+      pMem->flags = MEM_Blob|MEM_Ephem;
       return;
     }
     case 1: {
@@ -4841,7 +4879,36 @@ int sqlite3VdbeRecordCompareWithSkip(
       assert( (pRhs->flags & MEM_Zero)==0 || pRhs->n==0 );
       getVarint32NR(&aKey1[idx1], serial_type);
       testcase( serial_type==12 );
-      if( serial_type<12 || (serial_type & 0x01) ){
+      if( serial_type==11 ){
+        /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: this
+        ** fork's own repurposing of "reserved for future use" record
+        ** type 11 as a fixed 16-raw-byte trailing-rowid field (see
+        ** sqlite3SmallTypeSizes[11] and sqlite3VdbeSerialGet()'s case
+        ** 11) needs an ACTUAL comparison here, not the generic "type
+        ** 10/11 are reserved, sort before any real blob/string" fallback
+        ** below (still correct for type 10, genuinely unused) -- without
+        ** this, OP_Found/OP_IdxDelete-family lookups against a 9-16-byte
+        ** narrow-PK secondary index always report "no match" regardless
+        ** of actual content, since the fallback unconditionally returns
+        ** rc=-1. Only ever reached comparing two raw-16-byte-blob
+        ** representations of this exact field (see
+        ** sqlite3ExprCodeLoadIndexColumn()'s width>8 branch, which
+        ** produces the matching RHS via OP_Rowid's own P5 mode) -- an
+        ** ordinary memcmp is correct: this field is never itself a sort
+        ** key (sqlite3VdbeIdxKeyCompare() truncates it away for genuine
+        ** b-tree ordering purposes), only ever compared for exact-match
+        ** disambiguation between rows sharing equal real indexed
+        ** columns. */
+        int nStr = 16;
+        if( (d1+nStr) > (unsigned)nKey1 ){
+          pPKey2->errCode = (u8)SQLITE_CORRUPT_BKPT;
+          return 0;                /* Corruption */
+        }else{
+          int nCmp = MIN(nStr, pRhs->n);
+          rc = memcmp(&aKey1[d1], pRhs->z, nCmp);
+          if( rc==0 ) rc = nStr - pRhs->n;
+        }
+      }else if( serial_type<12 || (serial_type & 0x01) ){
         rc = -1;
       }else{
         int nStr = (serial_type - 12) / 2;
@@ -5178,14 +5245,44 @@ int sqlite3VdbeIdxRowid(sqlite3 *db, BtCursor *pCur, rowid_t *rowid){
   testcase( typeRowid==6 );
   testcase( typeRowid==8 );
   testcase( typeRowid==9 );
+#ifdef SQLITE_128BIT_ROWID
+  testcase( typeRowid==11 );
+  if( unlikely(typeRowid<1 || (typeRowid>9 && typeRowid!=11) || typeRowid==7) ){
+    goto idx_rowid_corruption;
+  }
+#else
   if( unlikely(typeRowid<1 || typeRowid>9 || typeRowid==7) ){
     goto idx_rowid_corruption;
   }
+#endif
   lenRowid = sqlite3SmallTypeSizes[typeRowid];
   testcase( (u32)m.n==szHdr+lenRowid );
   if( unlikely((u32)m.n<szHdr+lenRowid) ){
     goto idx_rowid_corruption;
   }
+
+#ifdef SQLITE_128BIT_ROWID
+  if( typeRowid==11 ){
+    /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: a 9-16-byte
+    ** narrow-PK secondary index's trailing rowid field -- 16 raw bytes
+    ** holding the full rowid_t verbatim (no order-preserving transform,
+    ** see rowidToRaw16Bytes()'s doc comment in sqliteInt.h). Read
+    ** directly, NOT via the generic sqlite3VdbeSerialGet() path below
+    ** (which decodes this serial type as a plain 16-byte BLOB Mem for
+    ** ITS generic callers -- correct for THEM, but Mem has no 128-bit
+    ** representation to hand back here; this function's whole job is to
+    ** reconstruct the actual rowid_t, so it must read the raw bytes
+    ** itself). Only reachable in a SQLITE_128BIT_ROWID build: a default
+    ** build's rowid_t is only 8 bytes wide and can never legitimately
+    ** contain a >8-byte narrow-PK table to produce this serial type from
+    ** in the first place (build.c's guards refuse it) -- the typeRowid
+    ** accept-check above already keeps type 11 rejected as corruption
+    ** there, unchanged from before step 10b. */
+    *rowid = rowidFromRaw16Bytes((const u8*)&m.z[m.n-lenRowid]);
+    sqlite3VdbeMemReleaseMalloc(&m);
+    return SQLITE_OK;
+  }
+#endif
 
   /* Fetch the integer off the end of the index record */
   sqlite3VdbeSerialGet((u8*)&m.z[m.n-lenRowid], typeRowid, &v);

@@ -4412,40 +4412,60 @@ void sqlite3ExprCodeLoadIndexColumn(
 ){
   i16 iTabCol = pIdx->aiColumn[iIdxCol];
   Table *pTab = pIdx->pTable;
+  Vdbe *v = pParse->pVdbe;
   if( iTabCol==XN_EXPR ){
     assert( pIdx->aColExpr );
     assert( pIdx->aColExpr->nExpr>iIdxCol );
     pParse->iSelfTab = iTabCur + 1;
     sqlite3ExprCodeCopy(pParse, pIdx->aColExpr->a[iIdxCol].pExpr, regOut);
     pParse->iSelfTab = 0;
-  }else if( (iTabCol<0 || iTabCol==pTab->iPKey)
+  }else if( iTabCol==XN_ROWID
    && (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0
   ){
     /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: this is the
-    ** trailing rowid slot of a rowid-table index's key -- NOT a real
+    ** trailing rowid slot of a rowid-table index's key (iTabCol==XN_ROWID
+    ** specifically -- NOT merely ==pTab->iPKey, which can also happen for
+    ** an ordinary, explicit reference to the PK column as a ordinary
+    ** sort-key column of the index, handled by the plain
+    ** sqlite3ExprCodeGetColumnOfTable() call below like any other column;
+    ** conflating the two here silently broke range/comparison queries
+    ** against an index that explicitly names a narrow-PK column, e.g.
+    ** CREATE INDEX i ON t(narrowPkCol, othercol) -- found while designing
+    ** step 10b, fixed here alongside it). The trailing slot is NOT a real
     ** table column, so the ordinary sqlite3ExprCodeGetColumnOfTable()
-    ** chokepoint below is the wrong tool here: it decodes the rowid back
-    ** to the column's natural BLOB/TEXT/REAL type (correct for a genuine
-    ** SELECT of that column), but insert.c stores this slot as the
-    ** classic-integer-compatible rowidToIdxInt64() PROJECTION instead
-    ** (required by SQLite's on-disk index format -- see build.c's
-    ** narrowPKFinalize() comment). A search/comparison key built here
-    ** must match that on-disk representation exactly, not the decoded
-    ** value, or OP_Found/OP_IFindKey and friends will never see a match.
-    ** Read the natural value via the same OP_Rowid+P4_TABLE decode as
-    ** always, then re-run it through OP_IntCopy's own P4_TABLE branch
-    ** (the exact conversion insert.c's storage path already uses) to
-    ** land on the identical projection. A >8-byte-wide alias can't reach
-    ** this code at all: build.c refuses to let such a table have any
-    ** index (step 10b territory). */
-    assert( pTab->pKeyWidth<=8 );
-    sqlite3VdbeAddOp2(pParse->pVdbe, OP_Rowid, iTabCur, regOut);
-    sqlite3VdbeAppendP4(pParse->pVdbe, pTab, P4_TABLE);
-    sqlite3VdbeAddOp2(pParse->pVdbe, OP_IntCopy, regOut, regOut);
-    sqlite3VdbeAppendP4(pParse->pVdbe, pTab, P4_TABLE);
+    ** chokepoint is the wrong tool for it specifically: it decodes the
+    ** rowid back to the column's natural BLOB/TEXT/REAL type (correct
+    ** for a genuine SELECT of that column, and correct for the explicit-
+    ** reference case above), but insert.c stores THIS slot as either the
+    ** classic-integer-compatible rowidToIdxInt64() PROJECTION (<=8 bytes,
+    ** step 10a) or a raw 16-byte blob, this fork's own record serial
+    ** type 11 (9-16 bytes, step 10b) instead (required by SQLite's
+    ** on-disk index format -- see build.c's narrowPKFinalize() comment).
+    ** A search/comparison key built here must match that on-disk
+    ** representation exactly, not the decoded value, or OP_Found/
+    ** OP_IFindKey and friends will never see a match, and (for a
+    ** non-unique index, where this field is also the duplicate-key
+    ** disambiguator) OP_IdxDelete could match the wrong entry. */
+    if( pTab->pKeyWidth<=8 ){
+      /* Read the natural value via the same OP_Rowid+P4_TABLE decode as
+      ** always, then re-run it through OP_IntCopy's own P4_TABLE branch
+      ** (the exact conversion insert.c's storage path already uses) to
+      ** land on the identical projection. */
+      sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+      sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+      sqlite3VdbeAddOp2(v, OP_IntCopy, regOut, regOut);
+      sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+    }else{
+      /* Step 10b: OP_Rowid's own P5=1 raw-16-byte-blob mode produces the
+      ** identical verbatim representation insert.c's OP_IdxAppendRowid
+      ** stores as the type-11 field (and sqlite3VdbeSerialGet() decodes
+      ** a real one back as, generically, for comparison purposes) in one
+      ** step -- no second opcode needed here, unlike the <=8-byte case. */
+      sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+      sqlite3VdbeChangeP5(v, 1);
+    }
   }else{
-    sqlite3ExprCodeGetColumnOfTable(pParse->pVdbe, pIdx->pTable, iTabCur,
-                                    iTabCol, regOut);
+    sqlite3ExprCodeGetColumnOfTable(v, pIdx->pTable, iTabCur, iTabCol, regOut);
   }
 }
 

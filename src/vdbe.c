@@ -1756,13 +1756,18 @@ case OP_SCopy: {            /* out2 */
   break;
 }
 
-/* Opcode: IntCopy P1 P2 * * *
+/* Opcode: IntCopy P1 P2 * P4 P5
 ** Synopsis: r[P2]=r[P1]
 **
 ** Transfer the integer value held in register P1 into register P2.
 **
 ** This is an optimized version of SCopy that works only for integer
 ** values.
+**
+** Narrow-fixed-width-PK-as-rowid (README.md): if P4 is a Table pointer
+** (P4_TABLE), see the case in vdbe.c for this fork's narrow-PK-specific
+** P4/P5-gated behavior, used only by insert.c's index-key-construction
+** loop.
 */
 case OP_IntCopy: {            /* out2 */
   pIn1 = &aMem[pOp->p1];
@@ -1781,11 +1786,121 @@ case OP_IntCopy: {            /* out2 */
   ** behavior. */
   if( pOp->p4type==P4_TABLE ){
     rowid_t rt = sqlite3VdbeMemToRowid(pIn1);
-    sqlite3VdbeMemSetInt64(pOut, rowidToIdxInt64(rt));
+#ifdef SQLITE_128BIT_ROWID
+    if( pOp->p5 ){
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: raw-16-
+      ** byte-blob mode, used only by insert.c's index-key-construction
+      ** loop for a qualifying 9-16-byte-wide rowid alias, feeding
+      ** OP_IdxAppendRowid immediately afterward. Same verbatim,
+      ** untransformed representation as OP_Rowid's own P5 mode -- see
+      ** its comment for the full reasoning. */
+      u8 aBuf[16];
+      rowidToRaw16Bytes(rt, aBuf);
+      sqlite3VdbeMemSetStr(pOut, (const char*)aBuf, 16, 0, SQLITE_TRANSIENT);
+    }else
+#endif
+    {
+      sqlite3VdbeMemSetInt64(pOut, rowidToIdxInt64(rt));
+    }
   }else{
     assert( (pIn1->flags & MEM_Int)!=0 );
     sqlite3VdbeMemSetInt64(pOut, pIn1->u.i);
   }
+  break;
+}
+
+/* Opcode: IdxAppendRowid P1 P2 P3 * *
+** Synopsis: r[P3]=r[P1]+type-11(r[P2])
+**
+** Narrow-fixed-width-PK-as-rowid (README.md), step 10b: P1 holds an
+** already-built index record (an ordinary BLOB produced by a prior
+** OP_MakeRecord over just the real indexed columns of a 9-16-byte-wide
+** narrow-PK table's secondary index -- i.e. NOT including a trailing
+** rowid field). P2 holds a raw 16-byte blob (produced by OP_Rowid's or
+** OP_IntCopy's own P5 raw-16-byte-blob mode) which is the rowid_t this
+** index entry should point back to. This opcode splices a new trailing
+** field of record serial type 11 (this fork's own repurposing of a
+** "reserved for future use" type -- see sqlite3SmallTypeSizes[11] and
+** sqlite3VdbeSerialGet()'s case 11 in vdbeaux.c) holding those 16 bytes
+** verbatim onto the end of P1's record, storing the result in P3.
+**
+** This opcode has no rowid_t-width-specific logic of its own -- it is
+** pure record-header/byte surgery -- so unlike most of this fork's
+** other additions it is not SQLITE_128BIT_ROWID-gated; it is simply
+** never emitted in a default build (a default build's NARROWPK_MAX_WIDTH
+** is 8, so no table can ever qualify for the >8-byte case this opcode
+** exists for).
+**
+** P3 must not be the same register as P1 or P2 (matching OP_MakeRecord's
+** own non-aliasing requirement for its output register): growing P1's
+** buffer in place could invalidate the very pointer being read from.
+*/
+case OP_IdxAppendRowid: {
+  Mem *pRecIn;             /* The already-built partial record (P1) */
+  Mem *pRowid;             /* The raw 16-byte rowid blob (P2) */
+  const u8 *zOld;          /* Start of pRecIn's bytes */
+  u8 *zNew;                /* Where to write the next output byte */
+  u32 oldN;                /* Byte length of pRecIn's record */
+  u32 oldHdrTotalLen;      /* pRecIn's own header-length varint value */
+  u32 oldHdrVarintBytes;   /* Byte length of THAT varint itself */
+  u32 newHdrTotalLen;      /* Recomputed header-length value, +1 field */
+  u32 nv;                  /* varint length probe, used while converging */
+  u32 nOut;                /* Total byte length of the spliced record */
+
+  assert( pOp->p1!=pOp->p3 && pOp->p2!=pOp->p3 );
+  pRecIn = &aMem[pOp->p1];
+  pRowid = &aMem[pOp->p2];
+  assert( pRecIn->flags & MEM_Blob );
+  assert( pRowid->flags & MEM_Blob );
+  assert( pRowid->n==16 );
+
+  /* pRecIn is itself the OUTPUT of an ordinary OP_MakeRecord call, which
+  ** may have left a pending zero-blob tail (MEM_Zero) if its own last
+  ** field was a large zeroblob -- materialize it now so oldN below is
+  ** pRecIn's true byte length and the type-11 field lands at the right
+  ** offset, not past a virtual gap. Same call OP_MakeRecord itself uses
+  ** for the identical reason on its own inputs. */
+  if( pRecIn->flags & MEM_Zero ){
+    if( sqlite3VdbeMemExpandBlob(pRecIn) ) goto no_mem;
+  }
+
+  zOld = (const u8*)pRecIn->z;
+  oldN = (u32)pRecIn->n;
+  oldHdrVarintBytes = getVarint32(zOld, oldHdrTotalLen);
+  assert( oldHdrTotalLen<=oldN );
+
+  /* Recompute the header-length varint's own byte-size after growing the
+  ** header by exactly 1 byte (the new type-11 serial-type varint, which
+  ** always fits in 1 byte since 11<128) -- rare, but a header whose
+  ** length varint sits right at a size boundary (e.g. 127->128) needs an
+  ** extra byte for the length varint itself too. This converges in at
+  ** most a couple of iterations, since each step adds only 0 or 1 byte. */
+  newHdrTotalLen = oldHdrTotalLen + 1;
+  while( 1 ){
+    nv = (u32)sqlite3VarintLen(newHdrTotalLen);
+    if( oldHdrTotalLen+1+(nv-oldHdrVarintBytes)==newHdrTotalLen ) break;
+    newHdrTotalLen = oldHdrTotalLen+1+(nv-oldHdrVarintBytes);
+  }
+
+  nOut = newHdrTotalLen + (oldN-oldHdrTotalLen) + 16;
+  pOut = &aMem[pOp->p3];
+  memAboutToChange(p, pOut);
+  if( sqlite3VdbeMemClearAndResize(pOut, (int)nOut) ){
+    goto no_mem;
+  }
+  pOut->n = (int)nOut;
+  pOut->flags = MEM_Blob;
+  zNew = (u8*)pOut->z;
+
+  zNew += sqlite3PutVarint(zNew, newHdrTotalLen);
+  memcpy(zNew, zOld+oldHdrVarintBytes, oldHdrTotalLen-oldHdrVarintBytes);
+  zNew += oldHdrTotalLen-oldHdrVarintBytes;
+  *(zNew++) = 11;
+  memcpy(zNew, zOld+oldHdrTotalLen, oldN-oldHdrTotalLen);
+  zNew += oldN-oldHdrTotalLen;
+  memcpy(zNew, pRowid->z, 16);
+
+  UPDATE_MAX_BLOBSIZE(pOut);
   break;
 }
 
@@ -6547,7 +6662,7 @@ case OP_RowData: {
   break;
 }
 
-/* Opcode: Rowid P1 P2 * P4 *
+/* Opcode: Rowid P1 P2 * P4 P5
 ** Synopsis: r[P2]=PX rowid of P1
 **
 ** Store in register P2 an integer which is the key of the table entry that
@@ -6561,10 +6676,13 @@ case OP_RowData: {
 ** (P4_TABLE) whose column at Table.iPKey qualifies as a BLOB/TEXT/REAL
 ** rowid alias (one of TF_PKeyIsBlob/TF_PKeyIsText/TF_PKeyIsReal set), the
 ** value stored in P2 is the reconstructed original column value in its
-** natural SQL type, not the raw rowid_t bits -- sqlite3ExprCodeGetColumnOfTable()
-** in expr.c is the only place that ever passes this P4; every other
-** OP_Rowid emission site needs the raw key for internal bookkeeping
-** (OP_SeekRowid, OP_Delete, comparisons) and correctly omits it.
+** natural SQL type, not the raw rowid_t bits -- every OP_Rowid emission
+** site that needs the raw key for internal bookkeeping (OP_SeekRowid,
+** OP_Delete, comparisons) correctly omits P4. If P5 is nonzero (step
+** 10b, SQLITE_128BIT_ROWID only), P2 instead gets a raw 16-byte-blob
+** verbatim dump of the rowid_t, used only by
+** sqlite3ExprCodeLoadIndexColumn() (expr.c) for a 9-16-byte-wide rowid
+** alias's index search key; P4 is unused in that mode.
 */
 case OP_Rowid: {                 /* out2, ncycle */
   VdbeCursor *pC;
@@ -6626,6 +6744,22 @@ case OP_Rowid: {                 /* out2, ncycle */
   ** TF_PKeyIsBlob/Text/Real set, so reaches the plain-integer path too
   ** even when P4 is present -- expr.c only sets it when one of those
   ** flags is already confirmed set). */
+#ifdef SQLITE_128BIT_ROWID
+  if( pOp->p5 ){
+    /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: raw-16-byte-
+    ** blob mode, used only by sqlite3ExprCodeLoadIndexColumn() (expr.c)
+    ** for a qualifying 9-16-byte-wide rowid alias, to build an index
+    ** search key's trailing field in the same verbatim, untransformed
+    ** representation OP_IdxAppendRowid stores on disk (serial type 11)
+    ** and sqlite3VdbeSerialGet() decodes it back as generically -- see
+    ** those two for the full reasoning. P4 is not used in this mode: no
+    ** natural-SQL-type reconstruction happens here at all, just a raw
+    ** byte dump of v, so there's no column kind/width to look up. */
+    u8 aBuf[16];
+    rowidToRaw16Bytes(v, aBuf);
+    sqlite3VdbeMemSetStr(pOut, (const char*)aBuf, 16, 0, SQLITE_TRANSIENT);
+  }else
+#endif
   if( pOp->p4type==P4_TABLE ){
     sqlite3VdbeMemSetRowid(pOut, v, pOp->p4.pTab);
   }else{
@@ -7154,12 +7288,17 @@ case OP_IdxDelete: {
 ** reads against P3 over to P1, thus possibly avoiding the need to
 ** seek and read cursor P3.
 */
-/* Opcode: IdxRowid P1 P2 * * *
+/* Opcode: IdxRowid P1 P2 * P4 P5
 ** Synopsis: r[P2]=rowid
 **
 ** Write into register P2 an integer which is the last entry in the record at
 ** the end of the index key pointed to by cursor P1.  This integer should be
 ** the rowid of the table entry to which this index entry points.
+**
+** Narrow-fixed-width-PK-as-rowid (README.md): if P4 is a Table pointer
+** (P4_TABLE) for a qualifying rowid alias, see the case in vdbe.c for
+** this fork's P4/P5-gated behavior (natural-type decode, or step 10b's
+** raw-16-byte-blob mode when P5 is also set).
 **
 ** See also: Rowid, MakeRecord.
 */
@@ -7209,13 +7348,21 @@ case OP_IdxRowid: {           /* out2, ncycle */
       /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a:
       ** wherecode.c's codeDeferredSeek() tags P4_TABLE here (mutually
       ** exclusive with the P4_INTARRAY case just below -- see its own
-      ** comment) for a qualifying <=8-byte-wide rowid alias, since
-      ** sqlite3VdbeIdxRowid() above always reconstructs via
+      ** comment) for a qualifying rowid alias, since sqlite3VdbeIdxRowid()
+      ** above, for a <=8-byte-wide alias, always reconstructs via
       ** rowidFromI64()'s LOW-bit-embedded convention, which is wrong for
       ** this table's real HIGH-aligned embedding (see OP_IdxRowid's own
       ** identical fixup, earlier in this same shared case, for the full
-      ** explanation). Fix it up the same way before it's used to seek. */
-      if( pOp->p4type==P4_TABLE ){
+      ** explanation). Fix it up the same way before it's used to seek.
+      ** Step 10b: for a 9-16-byte-wide alias, sqlite3VdbeIdxRowid() above
+      ** already returned the correct, full rowid_t verbatim (read
+      ** straight off the type-11 field, no low/high-half ambiguity to
+      ** begin with) -- no re-derivation needed or correct here. */
+      if( pOp->p4type==P4_TABLE
+#ifdef SQLITE_128BIT_ROWID
+       && pOp->p4.pTab->pKeyWidth<=8
+#endif
+      ){
         rowid = rowidFromIdxInt64(rowidTruncateToI64(rowid));
       }
       pTabCur->movetoTarget = rowid;
@@ -7232,9 +7379,9 @@ case OP_IdxRowid: {           /* out2, ncycle */
       /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: where.c's
       ** covering-index cursor-translation pass preserves whatever P4 the
       ** original OP_Rowid carried when rewriting it to OP_IdxRowid, so a
-      ** P4_TABLE tag can arrive here for a qualifying <=8-byte-wide rowid
-      ** alias read via a covering index. sqlite3VdbeIdxRowid() above
-      ** always reconstructs via rowidFromI64()'s LOW-bit-embedded
+      ** P4_TABLE tag can arrive here for a qualifying rowid alias read via
+      ** a covering index. For a <=8-byte-wide alias, sqlite3VdbeIdxRowid()
+      ** above always reconstructs via rowidFromI64()'s LOW-bit-embedded
       ** convention (the only one it knows about, correct for a classic
       ** INTEGER PK) -- wrong for a narrow-PK table, whose real embedding
       ** is HIGH-aligned (see rowidFromNarrowBytes()). Re-derive the
@@ -7243,9 +7390,39 @@ case OP_IdxRowid: {           /* out2, ncycle */
       ** recovers the original stored integer losslessly), then decode it
       ** to the natural type exactly as OP_Rowid's own P4_TABLE branch
       ** does -- every other OP_IdxRowid emission site omits P4 and is
-      ** unchanged. */
+      ** unchanged. Step 10b: for a 9-16-byte-wide alias,
+      ** sqlite3VdbeIdxRowid() above already returned the correct, full
+      ** rowid_t verbatim -- use it as-is, no re-derivation. */
+#ifdef SQLITE_128BIT_ROWID
+      if( pOp->p5 ){
+        /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: raw-16-
+        ** byte-blob mode (requires P4_TABLE, only meaningful when
+        ** pOp->p4.pTab->pKeyWidth>8), used only by pragma.c's
+        ** integrity_check self-consistency check -- it verifies the
+        ** index's OWN trailing rowid field (read here, via
+        ** sqlite3VdbeIdxRowid() above) matches what a freshly-built
+        ** search key for the current table row would contain (built by
+        ** sqlite3ExprCodeLoadIndexColumn(), whose width>8 branch produces
+        ** this exact same raw-16-byte-blob representation via OP_Rowid's
+        ** own P5 mode). rowid is already the correct, full rowid_t
+        ** verbatim in this case (see the p4type==P4_TABLE branch below's
+        ** identical reasoning) -- just dump it, no re-derivation. */
+        u8 aBuf[16];
+        assert( pOp->p4type==P4_TABLE );
+        rowidToRaw16Bytes(rowid, aBuf);
+        sqlite3VdbeMemSetStr(pOut, (const char*)aBuf, 16, 0, SQLITE_TRANSIENT);
+      }else
+#endif
       if( pOp->p4type==P4_TABLE ){
-        rowid_t rt = rowidFromIdxInt64(rowidTruncateToI64(rowid));
+        rowid_t rt;
+#ifdef SQLITE_128BIT_ROWID
+        if( pOp->p4.pTab->pKeyWidth>8 ){
+          rt = rowid;
+        }else
+#endif
+        {
+          rt = rowidFromIdxInt64(rowidTruncateToI64(rowid));
+        }
         sqlite3VdbeMemSetRowid(pOut, rt, pOp->p4.pTab);
       }else{
         pOut->u.i = rowidTruncateToI64(rowid);  /* Mem.u.i is a plain i64 */

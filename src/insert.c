@@ -2433,6 +2433,8 @@ void sqlite3GenerateConstraintChecks(
     int addrUniqueOk;    /* Jump here if the UNIQUE constraint is satisfied */
     int addrConflictCk;  /* First opcode in the conflict check logic */
     int nConflictCk;     /* Number of opcodes in conflict check logic */
+    int wideRowidTrailer; /* True: pIdx's trailing rowid field needs step
+                           ** 10b's OP_IdxAppendRowid splice treatment */
 
     if( aRegIdx[ix]==0 ) continue;  /* Skip indices that do not change */
     if( pUpsert ){
@@ -2463,6 +2465,7 @@ void sqlite3GenerateConstraintChecks(
     ** the insert or update.  Store that record in the aRegIdx[ix] register
     */
     regIdx = aRegIdx[ix]+1;
+    wideRowidTrailer = 0;
     for(i=0; i<pIdx->nColumn; i++){
       int iField = pIdx->aiColumn[i];
       int x;
@@ -2471,21 +2474,59 @@ void sqlite3GenerateConstraintChecks(
         sqlite3ExprCodeCopy(pParse, pIdx->aColExpr->a[i].pExpr, regIdx+i);
         pParse->iSelfTab = 0;
         VdbeComment((v, "%s column %d", pIdx->zName, i));
-      }else if( iField==XN_ROWID || iField==pTab->iPKey ){
-        /* Narrow-fixed-width-PK-as-rowid (README.md), step 10a: for a
-        ** qualifying <=8-byte-wide BLOB/TEXT/REAL rowid alias, regNewData
-        ** holds the decoded natural-typed value here, not a plain integer
-        ** -- tag P4_TABLE so OP_IntCopy converts it properly instead of
-        ** blindly copying (see its case in vdbe.c). A >8-byte-wide alias
-        ** can't reach this code at all: build.c refuses to let such a
-        ** table have any index in the first place (step 10b territory). */
+      }else if( iField==XN_ROWID ){
+        /* Narrow-fixed-width-PK-as-rowid (README.md): the automatic
+        ** trailing rowid-pointer field every rowid-table secondary index
+        ** gets (always exactly one, always last -- see build.c's
+        ** sqlite3CreateIndex(), the "pIndex->aiColumn[i] = XN_ROWID"
+        ** tail-append). Unlike an ordinary indexed column, SQLite's
+        ** on-disk index format requires this specific field be either a
+        ** classic-integer record type (1-9 except 7) or, as of step 10b,
+        ** this fork's own type 11 -- never a column's natural BLOB/TEXT/
+        ** REAL type directly. regNewData holds the decoded natural-typed
+        ** value; tag P4_TABLE so OP_IntCopy converts it properly instead
+        ** of blindly copying (see its case in vdbe.c) for a qualifying
+        ** rowid alias. Step 10a (<=8 bytes): projects to a plain 64-bit
+        ** classic-int field, included directly in the OP_MakeRecord call
+        ** below like any other field. Step 10b (9-16 bytes): P5=1
+        ** switches OP_IntCopy to raw-16-byte-blob mode instead --this
+        ** field is then EXCLUDED from the OP_MakeRecord call below (it
+        ** can't be, it's not classic-int-compatible) and spliced on
+        ** afterward as a genuine type-11 field by OP_IdxAppendRowid;
+        ** wideRowidTrailer flags that for the code after this loop. */
+        assert( i==pIdx->nColumn-1 );
         x = regNewData;
         sqlite3VdbeAddOp2(v, OP_IntCopy, x, regIdx+i);
         if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
-          assert( pTab->pKeyWidth<=8 );
           sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+          if( pTab->pKeyWidth>8 ){
+            sqlite3VdbeChangeP5(v, 1);
+            wideRowidTrailer = 1;
+          }
         }
         VdbeComment((v, "rowid"));
+      }else if( iField==pTab->iPKey ){
+        /* An EXPLICIT reference to the PK/rowid column, used as an
+        ** ordinary sort-key column of this index (distinct from the
+        ** XN_ROWID case above, even though both ultimately draw from the
+        ** same regNewData -- this position is a genuine indexed column,
+        ** not the special trailing pointer field, so it has none of that
+        ** field's on-disk-representation restrictions and should hold
+        ** the plain natural-typed value like any other column. Getting
+        ** this wrong silently broke range/comparison queries against
+        ** such an index for a narrow-PK column referenced explicitly and
+        ** non-last, e.g. CREATE INDEX i ON t(narrowPkCol, othercol) --
+        ** found while designing step 10b, fixed here alongside it. For
+        ** the classic INTEGER PRIMARY KEY case this is unchanged from
+        ** before: OP_IntCopy without P4_TABLE is already just a faster
+        ** SCopy for a value already known to be a plain MEM_Int. */
+        x = regNewData;
+        if( pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal) ){
+          sqlite3VdbeAddOp2(v, OP_SCopy, x, regIdx+i);
+        }else{
+          sqlite3VdbeAddOp2(v, OP_IntCopy, x, regIdx+i);
+        }
+        VdbeComment((v, "rowid (explicit)"));
       }else{
         testcase( sqlite3TableColumnToStorage(pTab, iField)!=iField );
         x = sqlite3TableColumnToStorage(pTab, iField) + regNewData + 1;
@@ -2493,7 +2534,20 @@ void sqlite3GenerateConstraintChecks(
         VdbeComment((v, "%s", pTab->aCol[iField].zCnName));
       }
     }
-    sqlite3VdbeAddOp3(v, OP_MakeRecord, regIdx, pIdx->nColumn, aRegIdx[ix]);
+    if( wideRowidTrailer ){
+      /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: build the
+      ** record over the real indexed columns only (excludes the last,
+      ** raw-16-byte-blob-mode register above), then splice the type-11
+      ** trailing field onto it separately -- ordinary OP_MakeRecord has
+      ** no way to classify one single field as this fork's own type 11. */
+      int regPartial = sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regIdx, pIdx->nColumn-1, regPartial);
+      sqlite3VdbeAddOp3(v, OP_IdxAppendRowid, regPartial,
+                         regIdx+pIdx->nColumn-1, aRegIdx[ix]);
+      sqlite3ReleaseTempReg(pParse, regPartial);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regIdx, pIdx->nColumn, aRegIdx[ix]);
+    }
     VdbeComment((v, "for %s", pIdx->zName));
 #ifdef SQLITE_ENABLE_NULL_TRIM
     if( pIdx->idxType==SQLITE_IDXTYPE_PRIMARYKEY ){

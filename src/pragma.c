@@ -2108,6 +2108,24 @@ void sqlite3Pragma(
             if( HasRowid(pTab) ){
               int jmp7;
               sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCur+j, 3);
+              /* Narrow-fixed-width-PK-as-rowid (README.md), step 10b: for
+              ** a qualifying 9-16-byte-wide rowid alias, r1+pIdx->nColumn-1
+              ** (built by sqlite3ExprCodeLoadIndexColumn()'s width>8
+              ** branch) holds a raw-16-byte-blob, not the plain-integer
+              ** truncation OP_IdxRowid produces by default -- tag P4_TABLE
+              ** and P5 so it produces the matching representation instead
+              ** (see its case in vdbe.c). For a <=8-byte-wide alias, the
+              ** existing untagged behavior already matches
+              ** rowidToIdxInt64()'s projection exactly (rowidFromI64()/
+              ** rowidTruncateToI64() are exact inverses), so no tag is
+              ** needed there, same as the classic INTEGER PRIMARY KEY
+              ** case this check was originally written for. */
+              if( (pTab->tabFlags & (TF_PKeyIsBlob|TF_PKeyIsText|TF_PKeyIsReal))!=0
+               && pTab->pKeyWidth>8
+              ){
+                sqlite3VdbeAppendP4(v, pTab, P4_TABLE);
+                sqlite3VdbeChangeP5(v, 1);
+              }
               jmp7 = sqlite3VdbeAddOp3(v, OP_Eq, 3, 0, r1+pIdx->nColumn-1);
               VdbeCoverageNeverNull(v);
               sqlite3VdbeLoadString(v, 3,

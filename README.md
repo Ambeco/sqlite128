@@ -319,17 +319,109 @@ forward, with step 1 already done.
       newly surfaced by that first-ever complete `veryquick.test` run — all confirmed pre-existing
       via the same A/B method, none related to narrow-PK or any step of this feature; see the
       design memory for the full list and the "still open" follow-up note below.
-    - **Step 10b (9–16-byte narrow-PK, `SQLITE_128BIT_ROWID`-only, genuine on-disk format change,
-      not started).**
+    - **Step 10b (9–16-byte narrow-PK, `SQLITE_128BIT_ROWID`-only, genuine on-disk format change) —
+      done.**
       A 9–16-byte `rowid_t` cannot fit any existing integer serial type, so this stage repurposes
       record serial type 11 — confirmed reserved and completely unused anywhere in this codebase or
       by mainline SQLite (unlike type 10, which already has a real meaning: the
       `sqlite3_vtab_nochange()` marker) — as a new, self-describing, fixed 16-byte field holding the
-      raw `rowid_t` verbatim (no order-preserving transform needed, since this field is provably
-      never used as a sort key — `sqlite3VdbeIdxKeyCompare()` already ignores it). No new page-1
-      format-version gating is needed: a >8-byte narrow-PK table can only already exist in a file
-      with the wide-rowid magic header set (per step 2's own width-cap validation), so type 11's
-      usage automatically inherits that existing gate.
+      raw `rowid_t` verbatim (no order-preserving transform: `rowidToRaw16Bytes()`/
+      `rowidFromRaw16Bytes()` in `sqliteInt.h`). No new page-1 format-version gating is needed: a
+      >8-byte narrow-PK table can only already exist in a file with the wide-rowid magic header set
+      (per step 2's own width-cap validation), so type 11's usage automatically inherits that
+      existing gate. `build.c`'s two step-7/10a guards are now conditional on
+      `pTab->pKeyWidth>NARROWPK_MAX_WIDTH` (16 under `SQLITE_128BIT_ROWID`, still 8 in a default
+      build, where a >8-byte narrow-PK table can never qualify at all) instead of an unconditional
+      `>8` refusal.
+
+      **Read side.** `sqlite3SmallTypeSizes[11]` is now 16 (was 0), so every generic
+      length-based record-header-walking caller (`sqlite3VdbeRecordUnpack()`, comparison paths,
+      etc.) automatically stays in sync. `sqlite3VdbeSerialGet()`'s case 11 decodes the field as an
+      ordinary 16-byte `MEM_Blob` (zero-copy, like the generic blob case) rather than reconstructing
+      a `rowid_t` — this generic decode point has no `Table` to know which table the value belongs
+      to, and (see below) this representation is exactly what generic Mem-vs-Mem comparison needs.
+      `sqlite3VdbeIdxRowid()` gained a dedicated, `SQLITE_128BIT_ROWID`-gated type-11 read branch
+      (bypassing the generic decode, reading the 16 bytes directly into a real `rowid_t` via
+      `rowidFromRaw16Bytes()`) alongside its existing classic-integer-type accept list; a default
+      build's accept-check is untouched, still rejecting type 11 as corruption (structurally
+      unreachable there regardless). `vdbe.c`'s shared `OP_IdxRowid`/`OP_DeferredSeek` handler is now
+      width-aware: for `pKeyWidth<=8` it keeps step 10a's `rowidFromIdxInt64(rowidTruncateToI64())`
+      re-derivation; for `pKeyWidth>8`, `sqlite3VdbeIdxRowid()` already returned the correct, full
+      `rowid_t` verbatim, used as-is.
+
+      **Write side — the actual new opcode.** Ordinary `OP_MakeRecord` has no way to classify a
+      single field as this fork's own type 11 (`Mem` has no 128-bit representation, deliberately —
+      see the design memory). Both write-side record-construction sites (`insert.c`'s
+      UNIQUE-constraint/index-key loop, and `delete.c`'s shared `sqlite3GenerateIndexKey()`, used by
+      `DELETE`'s index cleanup, `pragma.c`'s `integrity_check`, and `build.c`'s `CREATE INDEX`
+      bulk-populate / `where.c`'s automatic-index materialization) now, for a >8-byte-wide alias,
+      build the record over the real indexed columns only, then call a new opcode,
+      `OP_IdxAppendRowid` (`vdbe.c`), to splice a type-11 field onto the end: it recomputes the
+      record's header-length varint for the +1-byte growth (correctly handling the rare case where
+      the varint's own byte-length also grows, e.g. a header at exactly the 127/128-byte boundary),
+      copies the existing serial-type list and data forward, and appends the 16 raw bytes. Two small
+      existing opcodes gained a `P5` flag to feed it: `OP_Rowid` (cursor → raw-16-byte-blob, used by
+      `sqlite3ExprCodeLoadIndexColumn()`'s search-key construction) and `OP_IntCopy` (natural-typed
+      Mem → raw-16-byte-blob via the same `sqlite3VdbeMemToRowid()` dispatch its `P5=0` classic-int
+      projection already uses, for `insert.c`'s storage path). `OP_IdxAppendRowid` itself has no
+      `rowid_t`-width-specific logic (pure byte/varint surgery) so, unlike most of this fork's other
+      additions, it isn't `SQLITE_128BIT_ROWID`-gated — it's simply never emitted in a default build.
+
+      **Two bugs found and fixed while implementing this** (both go deeper than step 10b itself —
+      see the design memory for the full debugging narrative):
+      - **A step-10a regression, not a step-10b-only bug:** `insert.c`'s index-key loop and
+        `sqlite3ExprCodeLoadIndexColumn()` (`expr.c`) both matched on `iField==XN_ROWID ||
+        iField==pTab->iPKey` without distinguishing them — but an index can reference the narrow-PK
+        column *explicitly*, as an ordinary sort-key column (e.g.
+        `CREATE INDEX i ON t(narrowPkCol, othercol)`), at a *non-last* position, in *addition* to the
+        implicit trailing `XN_ROWID` slot every rowid-table index still gets appended automatically.
+        Both call sites applied the trailing-slot's special (classic-int-projection, or now
+        raw-16-byte-blob) treatment to *that* explicit reference too, silently breaking range and
+        comparison queries against such an index — reproduced directly: `id > x'...' AND id < x'...'`
+        via an explicit `INDEXED BY` on a 2-column index leading with the narrow-PK column returned
+        zero rows instead of the matching one, for both an 8-byte and a 16-byte narrow-PK. Fixed by
+        splitting the check: only `iField==XN_ROWID`/`iTabCol==XN_ROWID` (the guaranteed-synthetic
+        marker) gets the special on-disk-representation treatment; a real, explicit
+        `iField==pTab->iPKey` reference now falls through to the ordinary column path (`OP_SCopy` /
+        `sqlite3ExprCodeGetColumnOfTable()`), holding the plain natural-typed value like any other
+        indexed column, exactly as it always should have.
+      - **`sqlite3VdbeRecordCompareWithSkip()`'s (`vdbeaux.c`) hand-optimized "RHS is a blob" fast
+        path** hard-codes `serial_type<12` as "sorts before any real blob" — a leftover from when
+        types 10/11 were genuinely unused reserved slots (the comment there still says so). This
+        unconditionally returned "less than" for a type-11 field being compared, regardless of
+        actual content — reproduced directly: with the `insert.c`/`expr.c` fix alone,
+        `PRAGMA integrity_check` reported "row missing from index" for every row of a 9-16-byte
+        narrow-PK table with any secondary index, because `OP_Found`'s underlying comparison could
+        never see a match. Fixed by adding an explicit `serial_type==11` case that does a genuine
+        16-byte `memcmp`, ahead of the old `<12` fallback (still correct for type 10, still
+        genuinely unused). This function's numeric-RHS branches needed no equivalent fix: they
+        already treat any `serial_type>=10` other than exactly 10 as "sorts after," which happens to
+        already be correct for a type-11 field (it's never compared against a numeric RHS in
+        practice regardless, since the only legitimate RHS at that position is another
+        raw-16-byte-blob, but the existing code's behavior for it is harmless either way).
+
+      **`pragma.c`'s `integrity_check`** needed one more fix: its self-consistency check (comparing
+      `OP_IdxRowid`'s raw read of an index entry's trailing field against
+      `sqlite3ExprCodeLoadIndexColumn()`'s freshly-built expectation for the current table row) used
+      a bare, untagged `OP_IdxRowid` — which, by a coincidence of `rowidFromI64()`/
+      `rowidTruncateToI64()` being exact inverses, already happened to match for `pKeyWidth<=8`, but
+      not for `pKeyWidth>8` (where the untagged path's `rowidTruncateToI64()` extracts the wrong
+      low-order half, matching nothing). `OP_IdxRowid` gained its own `P5` flag (parallel to
+      `OP_Rowid`'s) to produce the matching raw-16-byte-blob when tagged; `pragma.c` now tags it only
+      for a qualifying `pKeyWidth>8` table, leaving the already-correct `pKeyWidth<=8`/classic-PK
+      behavior untouched. `upsert.c`'s `OP_IdxRowid`→`OP_SeekRowid` chain and `wherecode.c`'s
+      `codeDeferredSeek()` needed only their leftover `assert(pKeyWidth<=8)` removed — both were
+      already width-generic, `OP_IdxRowid`'s width-aware fix and `OP_SeekRowid`'s
+      `sqlite3VdbeMemToRowid()` dispatch cover any width automatically.
+
+      **Verified** with dedicated repros for all of the above under `SQLITE_128BIT_ROWID` (covering-
+      index reads, `DELETE`, `UPDATE`, `UPSERT` via a secondary unique index, `ANALYZE`,
+      `integrity_check`, and composite indexes with the narrow-PK column in both a leading and a
+      non-leading explicit position, alongside the automatic trailing slot), plus the full
+      established regression suite (27 files) and a broader general-comparison sanity set (17 more
+      files: `select*`, `where*`, `in*`, `collate*`, `insert*`, `blob.test` — given the change to a
+      very hot, shared comparison function) — all clean under both a default build and
+      `SQLITE_128BIT_ROWID`, with identical per-file counts in both configs.
 11. **Fix the two confirmed §5a bugs found by the dedicated `SQLITE_128BIT_ROWID` audit — done.**
     `VACUUM`/`INSERT ... SELECT` (via `insert.c`'s `xferOptimization()`, including `vdbe.c`'s
     `OP_RowCell` opcode it relies on) and `ALTER TABLE ... DROP COLUMN` (`alter.c`'s row-rewrite)

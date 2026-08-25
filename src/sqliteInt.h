@@ -1235,6 +1235,44 @@ static SQLITE_INLINE rowid_t rowidFromIdxInt64(i64 v){
 #endif
 }
 
+#ifdef SQLITE_128BIT_ROWID
+/*
+** rowidToRaw16Bytes()/rowidFromRaw16Bytes(): step 10b (README.md) --
+** verbatim big-endian 16-byte serialization of a FULL rowid_t, with NO
+** order-preserving transform (unlike rowidToNarrowBytes()/
+** rowidFromReal()) and no high-aligned zero-padding (unlike
+** rowidToIdxInt64(), this always covers the whole rowid_t, not a
+** narrower embed within it).
+**
+** Used ONLY for a 9-16-byte-wide narrow-PK-as-rowid column's secondary
+** index trailing "rowid" field (the new record serial type 11 -- see
+** the OP_IdxAppendRowid case in vdbe.c and sqlite3VdbeIdxRowid() in
+** vdbeaux.c), which is purely an internal "go find the real row"
+** pointer, never itself compared as a sort key (the real indexed
+** columns that precede it already establish sort order) -- so unlike
+** every other rowidFromX()/rowidToX() pair in this file, there is no
+** ordering property to preserve here, just losslessness. Only exists
+** under SQLITE_128BIT_ROWID: a >8-byte narrow-PK column cannot qualify
+** at all in a default build (NARROWPK_MAX_WIDTH==8 there), so this
+** pair, and everything that calls it, is dead code by construction in
+** that build -- no need for a default-build fallback definition.
+*/
+static SQLITE_INLINE void rowidToRaw16Bytes(rowid_t x, u8 *aOut){
+  sqlite3_uint128 v = x;
+  int i;
+  for(i=15; i>=0; i--){
+    aOut[i] = (u8)(int128ToU64(v) & 0xff);
+    v = int128ShiftRight(v, 8);
+  }
+}
+static SQLITE_INLINE rowid_t rowidFromRaw16Bytes(const u8 *aIn){
+  sqlite3_uint128 v = int128FromU64(aIn[0]);
+  int i;
+  for(i=1; i<16; i++) v = int128Add(int128ShiftLeft(v,8), int128FromU64(aIn[i]));
+  return v;
+}
+#endif /* SQLITE_128BIT_ROWID */
+
 /* A bitfield type for use inside of structures.  Always follow with :N where
 ** N is the number of bits.
 */
