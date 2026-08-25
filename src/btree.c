@@ -3712,8 +3712,27 @@ static int newDatabase(BtShared *pBt){
 #ifdef SQLITE_128BIT_ROWID
   /* BTREE_ROWID_FORMAT: secondary, informational signal that this is a
   ** wide-rowid database (the page-1 magic header is the mechanism that
-  ** actually matters for refusing to open -- see BTS_WIDE_ROWID). */
-  put4byte(&data[36 + (BTREE_ROWID_FORMAT-1)*4], 1);
+  ** actually matters for refusing to open -- see BTS_WIDE_ROWID).
+  **
+  ** sqlite3BtreeGetMeta()'s own offset formula is "36 + idx*4", no "-1"
+  ** (confirmed by reading it directly) -- meta slot N sits at byte
+  ** 36+4*N, not 36+4*(N-1). This line used (BTREE_ROWID_FORMAT-1),
+  ** writing to offset 68 (36+4*8) instead of the intended offset 72
+  ** (36+4*9) -- offset 68 is BTREE_APPLICATION_ID's own slot (=8, so
+  ** correctly read via sqlite3BtreeGetMeta(pBt,8,...) => 36+4*8=68),
+  ** meaning every new database created by this build silently
+  ** overwrote its own application_id with 1 instead of leaving it 0.
+  ** Confirmed via test/pragma.test's pragma-8.3.1 ("PRAGMA
+  ** application_id" returning 1 instead of 0 on a fresh database) and
+  ** ext/recover/test/recoverslowidx.test showing the same "application_id
+  ** = '1'" where mainline's own recorded expectation is '0'. Also meant
+  ** BTREE_ROWID_FORMAT's OWN slot (offset 72) was never actually
+  ** written at all, leaving this "secondary, informational" signal
+  ** permanently unset (0) on every database this build ever created --
+  ** harmless on its own per this comment's original note (the page-1
+  ** magic header is what actually matters), but worth fixing alongside
+  ** the application_id clobber since it's the same one-line typo. */
+  put4byte(&data[36 + BTREE_ROWID_FORMAT*4], 1);
 #endif
 #ifndef SQLITE_OMIT_AUTOVACUUM
   assert( pBt->autoVacuum==1 || pBt->autoVacuum==0 );

@@ -462,9 +462,10 @@ step-by-step plan in §3, and not speculative follow-up work like §4 — these 
 defects). Kept separate and explicit so they aren't lost track of. §5b (pre-existing
 `SQLITE_128BIT_ROWID` foundation bugs, unrelated to narrow-PK) does not affect a default build; §5a
 has one open item that does (see below — it's a narrow-PK-heuristic bug, not width/build-specific).
-§5a's step-11 batch is fixed; one further bug was found afterward and remains open. §5b has its
-three most impactful bugs fixed (2026-08-25), and every other originally-listed item re-triaged and
-either resolved as a side effect or confirmed (not assumed) to be intentional, by-design behavior —
+§5a's step-11 batch is fixed; one further bug was found afterward and remains open. §5b has five
+bugs fixed (2026-08-25), and every originally-listed item re-triaged and either resolved as a side
+effect, confirmed (not assumed) to be intentional by-design behavior, confirmed transient
+flakiness, or characterized as a genuinely still-open item —
 see §5b's own subsections for the full breakdown and what little remains genuinely open.
 
 ### 5a. Narrow-PK feature bugs (this fork's own code)
@@ -567,7 +568,7 @@ Found incidentally while testing the narrow-PK feature (steps 6, 7, 8, 10a), eac
 `git stash` A/B testing to reproduce identically with none of this feature's code present — i.e.
 these are gaps in the wide-rowid foundation (step 1) itself, or in wholly unrelated subsystems,
 predating and unrelated to narrow-PK-as-rowid. Originally catalogued without root-causing; a
-follow-up audit (2026-08-25) root-caused and fixed the three most impactful items (below), which
+follow-up audit (2026-08-25) root-caused and fixed five items (below), which
 turned out to resolve the large majority of the originally-listed test failures as a side effect.
 
 #### Fixed (2026-08-25)
@@ -639,10 +640,28 @@ turned out to resolve the large majority of the originally-listed test failures 
   immediately after `newDatabase()` sets `BTS_WIDE_ROWID`. **Impact:** alone, resolved
   `test/ovfl.test` (1/3 → 0/3), `test/amatch1.test` (10/20 → 0/20), `test/vacuum6.test` (11/35 →
   0/35), `test/sort5.test` (1/16 → 0/16), and `test/pagesize.test` (2/100 → 0/100) entirely.
+- **`newDatabase()` (`btree.c`) wrote `BTREE_ROWID_FORMAT`'s meta value to the wrong page-1 offset,
+  silently clobbering every new database's `application_id`.** `sqlite3BtreeGetMeta()`'s offset
+  formula (confirmed by reading it directly) is `36 + idx*4` — no `-1` adjustment: meta slot N sits
+  at byte `36+4*N`. `newDatabase()`'s write used `(BTREE_ROWID_FORMAT-1)*4` (`BTREE_ROWID_FORMAT` is
+  9, this fork's own new meta slot), landing on offset 68 instead of the intended offset 72 — but
+  offset 68 is exactly `BTREE_APPLICATION_ID`'s slot (=8, correctly read via
+  `sqlite3BtreeGetMeta(pBt,8,...)` ⇒ `36+4*8=68`). Every database this build ever created silently
+  got `application_id=1` instead of leaving it at the correct default of 0, and
+  `BTREE_ROWID_FORMAT`'s own slot was never actually written at all (staying permanently unset) —
+  harmless on its own, since the page-1 magic header is what actually gates narrow-vs-wide
+  detection (this slot is explicitly documented as a secondary, non-load-bearing signal), but the
+  `application_id` clobber is a real, user-visible correctness bug for any application that relies
+  on it. Root-caused via `test/pragma.test`'s `pragma-8.3.1` (`PRAGMA application_id` returning 1
+  instead of 0 on a fresh database) together with `ext/recover/recoverslowidx.test` showing the
+  identical `application_id = '1'` anomaly independently. Fixed by removing the erroneous `-1`.
+  **Impact:** resolved `test/pragma.test` (1/242 → 0/242) and
+  `ext/recover/recoverslowidx.test` (2/6 → 0/6) entirely.
 - All five fixes verified with the established 27-file regression suite plus the 15-file general
-  comparison/index/vacuum sanity set, the originally-listed §5b test files, and (for the first two
+  comparison/index/vacuum sanity set, every originally-listed §5b test file, and (for the first two
   fixes) a full `quicktest` run for the default build — all clean under both a default build and
-  `SQLITE_128BIT_ROWID`.
+  `SQLITE_128BIT_ROWID`, with unchanged, expected counts for every remaining not-yet-fixed item
+  (confirming zero regressions).
 
 #### Confirmed *not* bugs (intentional, by-design behavior)
 
@@ -670,12 +689,51 @@ decisions, not defects:
   build never writes narrow-format cells — see `newDatabase()`'s own comment) — so a test that goes
   on to write to that same connection correctly fails, just with a different (arguably more
   informative) error than the test's mainline-only expectation. No build with this project's own
-  narrow-file-is-read-only design could pass these specific assertions either.
+  narrow-file-is-read-only design could pass these specific assertions either. The same mechanism
+  was independently confirmed (each by reading its own hex dump/deserialize call directly, not
+  inferred from the shared error text alone) in four more files re-triaged in a follow-up pass:
+  **`test/corruptN.test`** (`corruptN-1.1`), **`test/corruptL.test`** (12 of its 13 failures; the
+  13th, `corruptL-2.2`, is a cascade from `corruptL-2.1`'s setup hitting this same mechanism, not an
+  independent cause), **`test/fts3corrupt4.test`**, and **`test/fts3fuzz001.test`** — all inject the
+  identical standard narrow magic header via `db deserialize [decode_hexdb {...}]`.
 - None of the above are test-environment artifacts or genuine defects — each was confirmed by
   decoding the actual bytes/mechanism involved, not assumed.
 
 #### Still open
 
+- **`sqlite3_recover_init`/`run`/`finish` (`ext/recover/`) leaves the *source* connection unable to
+  write afterward, but only under `SQLITE_128BIT_ROWID`.** Confirmed via a minimal repro (create an
+  ordinary table, run `.recover` against the same connection to a separate output file, then try an
+  unrelated `ALTER TABLE` on the original connection) and an A/B against a freshly-built default
+  binary: the identical script leaves the connection perfectly writable under a default build
+  (empty error) but produces "attempt to write a readonly database" under this build. Bisected to
+  the specific call: `sqlite3_recover_init` alone and `$R config testdb ...` alone are both harmless
+  (writable afterward either way); the failure is introduced specifically by `$R run`. **Confirmed
+  *not* the `BTS_LEGACY_NARROW` mechanism** described above — directly inspected the source
+  database's page-1 magic-header bytes before and after the `.recover` run and they are byte-for-
+  byte identical (still the wide magic header both times), so this is some *other* mechanism setting
+  a read-only state on the live connection without touching the on-disk file, not yet identified.
+  `ext/recover/sqlite3recover.c` itself has zero references to any wide-rowid-related symbol
+  (confirmed via grep) — it was written with no awareness of this fork's format extension at all,
+  so the interaction is presumably indirect (e.g. via how it opens/locks a second handle on the same
+  file, and how that handle's state ends up affecting the original connection's `BtShared` — not
+  confirmed, would need to read deep into `sqlite3recover.c`, a large file this project has not
+  otherwise touched, plus SQLite's own `BtShared`-sharing/locking internals). This is a *recurring,
+  high-impact* pattern, not a one-off: it's what's actually driving the remaining failures in
+  **`ext/recover/recover1.test`**, **`ext/recover/recovercorrupt2.test`**, and
+  **`ext/recover/recoverold.test`** (each independently confirmed to hit this same "readonly after
+  `run`" point, with `recoverold`'s further `lost_and_found`-vs-actual-table-name mismatches being a
+  downstream cascade of the same root failure disrupting its recovery flow, not a separate bug).
+  Worth prioritizing given how central `.recover` is and how many of its own tests this touches.
+- **`ext/recover/recoverfault.test`** — 4 of 2953 sub-tests fail deep in its OOM fault-injection
+  sequence (simulated malloc failure specifically at allocation #736-738 of a given run not being
+  handled gracefully, "out of memory" surfacing through where the test expects a clean recovery).
+  Not root-caused. Given how failure-injection tests like this work (the exact allocation *index* at
+  which OOM is simulated is extremely sensitive to the total number of allocations a code path
+  makes), this is plausibly just a consequence of wide-rowid code paths allocating a different
+  number of times than the narrow-only counts this test was originally tuned against, exposing an
+  OOM-handling gap only reachable at that specific, narrow point — or it could be a genuine gap.
+  Low priority given how narrow it is (4 out of 2953) relative to the investigation depth needed.
 - **`ext/fts5/test/fts5origintext4.test`** (`fts5origintext4-1.2.1`) — a performance-characteristic
   test asserting that FTS5's page cache uses *more* than 250000 bytes for a broad, low-selectivity
   query (`'the'`), verifying that its "doclist-index" optimization does *not* kick in and short-cut
@@ -689,18 +747,26 @@ decisions, not defects:
   data loss or incorrect query results — only how much a page cache measurement crosses a hardcoded
   threshold) relative to the depth of investigation needed; a natural candidate for its own
   dedicated follow-up rather than folding into this pass.
-- Several `ext/recover/*` tests — not yet re-triaged against the fixes above.
-- Two other clusters from step 10a's original `veryquick.test` run, not yet re-triaged: one
-  sub-case of `test/pragma.test`, and a larger cluster of `corruptL`/`corruptN`/`dbpage`/`diskfull`/
-  `fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases.
 
-**Suggested next steps:** (1) `ext/recover/*` and the `pragma`/`corruptL`/`corruptN`/`dbpage`/
-`diskfull`/`fts3*` clusters still haven't been re-triaged against today's three fixes at all —
-likely several will turn out already resolved, the same way most of the original list did here;
-(2) `fts5origintext4`'s doclist-index memory-usage gap, if ever prioritized, on its own; (3) after
+Everything else in `ext/recover/*` (`recoverbuild`, `recoverclobber`, `recovercorrupt`,
+`recovercorrupt3`, `recovercorrupt4`, `recoverfault2`, `recoverold` beyond the cascade above,
+`recoverpgsz`, `recoverrowid`, `recoversql`) and in the remaining `pragma`/`corruptL`/`corruptN`/
+`dbpage`/`dbpagefault`/`diskfull`/`fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cluster from
+step 10a's original `veryquick.test` run is now clean (0 errors) — including
+`ext/recover/recovercorrupt.test`, whose first run showed a `sv_test.db2: no such file or
+directory` mid-fuzz-loop failure that did **not** reproduce on a clean rerun (0 errors out of 10003
+tests, running to completion) — confirmed as transient filesystem interference (this working
+directory is Dropbox-synced; see the project's own documented build-time file-lock flakiness for
+the same underlying cause), not a genuine defect.
+
+**Suggested next steps, in priority order:** (1) the `.recover`-leaves-connection-readonly bug,
+given how many of `ext/recover/*`'s own tests it's responsible for and how central `.recover` is as
+a real-world recovery tool; (2) `recoverfault`'s narrow OOM-handling gap and `fts5origintext4`'s
+doclist-index memory-usage gap, both low-priority/niche relative to investigation depth; (3) after
 that, `SQLITE_128BIT_ROWID` would be in a substantially stronger position for anything beyond this
-fork's own narrow-PK feature — the three fixes in this section addressed foundational table-b-tree
-cell-size and file-creation-time budget bugs that affected any wide-rowid table, not edge cases.
+fork's own narrow-PK feature — every originally-listed §5b test file has now been triaged (proven,
+not assumed) to be either fixed, intentional by-design behavior, transient environment flakiness, or
+one of the two remaining characterized-but-open items above.
 
 ## 6. Attribution
 
