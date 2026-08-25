@@ -1552,14 +1552,39 @@ static u16 cellSizePtrNoPayload(MemPage *pPage, u8 *pCell){
   ** this function verifies that this invariant is not violated. */
   CellInfo debuginfo;
   pPage->xParseCell(pPage, pCell, &debuginfo);
-#else
-  UNUSED_PARAMETER(pPage);
 #endif
 
   assert( pPage->childPtrSize==4 );
-  pEnd = pIter + 9;
+  /* Narrow-fixed-width-PK-as-rowid/wide-rowid-foundation note: this is a
+  ** fast-path re-implementation of the varint-length scan
+  ** btreeParseCellPtrNoPayload() (this page type's xParseCell, the "ground
+  ** truth" the SQLITE_DEBUG assert below compares against) already does
+  ** correctly via sqlite3GetVarintRowid(pPage->pBt->btsFlags &
+  ** BTS_WIDE_ROWID). This copy hardcoded a 9-byte (narrow-only) cap,
+  ** silently truncating -- and so under-reporting the size of -- any
+  ** interior table-b-tree cell whose key varint genuinely needs more than
+  ** 9 bytes in a wide (SQLITE_128BIT_ROWID) file. Since this is the
+  ** cell-size function for EVERY interior intkey-page cell (not just a
+  ** narrow-PK-specific case -- rowidFromI64()'s sign-extension means any
+  ** negative classic-INTEGER rowid also needs the full 19-byte wide
+  ** varint form), this under-reporting corrupts general b-tree navigation
+  ** for essentially any wide-rowid table with more than one level of
+  ** interior pages -- "database disk image is malformed" once a
+  ** truncated cell is later read back. The SQLITE_DEBUG assert below
+  ** could not catch this: it compares against btreeParseCellPtrNoPayload,
+  ** which was already correct, so it would have failed loudly in any
+  ** debug build -- this bug was only reachable in a build without
+  ** SQLITE_DEBUG asserts compiled in. Confirmed via direct reproduction
+  ** (test/boundary1.test's 64 boundary-value rowids, once enough per-row
+  ** payload existed to force a page beyond a single leaf) and by reading
+  ** btreeParseCellPtrNoPayload's correct, already-width-aware
+  ** implementation for comparison. Pre-existing wide-rowid-foundation
+  ** bug, unrelated to narrow-PK, tracked in README.md §5b. */
+  pEnd = pIter + ((pPage->pBt->btsFlags & BTS_WIDE_ROWID) ? 19 : 9);
   while( (*pIter++)&0x80 && pIter<pEnd );
+#ifdef SQLITE_DEBUG
   assert( debuginfo.nSize==(u16)(pIter - pCell) || CORRUPT_DB );
+#endif
   return (u16)(pIter - pCell);
 }
 static u16 cellSizePtrTableLeaf(MemPage *pPage, u8 *pCell){
@@ -1585,17 +1610,33 @@ static u16 cellSizePtrTableLeaf(MemPage *pPage, u8 *pCell){
     }while( *(pIter)>=0x80 && pIter<pEnd );
   }
   pIter++;
-  /* pIter now points at the 64-bit integer key value, a variable length
-  ** integer. The following block moves pIter to point at the first byte
-  ** past the end of the key value. */
-  if( (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80
-   && (*pIter++)&0x80 ){ pIter++; }
+  /* pIter now points at the rowid key value, a variable length integer.
+  ** The following block moves pIter to point at the first byte past the
+  ** end of the key value.
+  **
+  ** Narrow-fixed-width-PK-as-rowid/wide-rowid-foundation note: this used
+  ** to be a hardcoded 9-byte-max unrolled scan (8 explicit continuation
+  ** checks, then one final unconditional byte) -- correct only for the
+  ** narrow (legacy, sqlite3PutVarint()) key encoding. Under a wide
+  ** (SQLITE_128BIT_ROWID) file, a key varint can need up to 19 bytes (see
+  ** putVarint128()'s comment in util.c), which this hardcoded cap
+  ** silently truncated, under-reporting the cell's size. This is the
+  ** cell-size function for EVERY table (intkey) leaf cell -- the single
+  ** most heavily used of this whole family of fast-path scans -- so this
+  ** was the dominant contributor to "database disk image is malformed"
+  ** on essentially any wide-rowid table once cells stopped being trivial
+  ** (rowidFromI64()'s sign-extension means any negative classic-INTEGER
+  ** rowid needs the full 19-byte form too, not just narrow-PK-specific
+  ** wide values). See cellSizePtrNoPayload()'s identical fix, just above,
+  ** for the interior-page counterpart of this same bug family. Confirmed
+  ** via direct reproduction: test/boundary1.test's 64 boundary-value
+  ** rowids, once enough per-row payload existed to make this matter.
+  ** Pre-existing wide-rowid-foundation bug, unrelated to narrow-PK,
+  ** tracked in README.md §5b. */
+  {
+    u8 *pKeyEnd = pIter + ((pPage->pBt->btsFlags & BTS_WIDE_ROWID) ? 19 : 9);
+    while( (*pIter++)&0x80 && pIter<pKeyEnd );
+  }
   testcase( nSize==pPage->maxLocal );
   testcase( nSize==(u32)pPage->maxLocal+1 );
   if( nSize<=pPage->maxLocal ){
@@ -8216,11 +8257,28 @@ static int balance_quick(MemPage *pParent, MemPage *pPage, u8 *pSpace){
     ** The first of the while(...) loops below skips over the record-length
     ** field. The second while(...) loop copies the key value from the
     ** cell on pPage into the pSpace buffer.
-    */
+    **
+    ** Narrow-fixed-width-PK-as-rowid/wide-rowid-foundation note: the key
+    ** varint's max length depends on the whole file's BTS_WIDE_ROWID state
+    ** -- 9 bytes (narrow, sqlite3PutVarint()'s own cap) or 19 bytes (wide,
+    ** see putVarint128()'s comment in util.c). This was hardcoded at 9
+    ** unconditionally, silently truncating a wide file's key varint
+    ** whenever it genuinely needed more than 9 bytes (which, given
+    ** rowidFromI64()'s sign-extension, is EVERY negative classic-INTEGER
+    ** rowid, not just narrow-PK-specific wide values) -- corrupting the
+    ** divider cell and, once caught by a later access, "database disk
+    ** image is malformed". Confirmed via direct reproduction: 64 rows with
+    ** boundary-value rowids (mix of positive/negative, test/boundary1.test)
+    ** and enough per-row payload to force a page split lost half their rows
+    ** silently; rows alone (tiny payload, single leaf page, no split ever
+    ** triggered) were unaffected -- consistent with this code only running
+    ** during a split. Pre-existing wide-rowid-foundation bug, unrelated to
+    ** narrow-PK (reproduces with an ordinary classic INTEGER PRIMARY KEY
+    ** table), tracked in README.md §5b. */
     pCell = findCell(pPage, pPage->nCell-1);
-    pStop = &pCell[9];
+    pStop = &pCell[(pBt->btsFlags & BTS_WIDE_ROWID) ? 19 : 9];
     while( (*(pCell++)&0x80) && pCell<pStop );
-    pStop = &pCell[9];
+    pStop = &pCell[(pBt->btsFlags & BTS_WIDE_ROWID) ? 19 : 9];
     while( ((*(pOut++) = *(pCell++))&0x80) && pCell<pStop );
 
     /* Insert the new divider cell into pParent. */
@@ -9269,7 +9327,13 @@ static int anotherValidCursor(BtCursor *pCur){
 */
 static int balance(BtCursor *pCur){
   int rc = SQLITE_OK;
-  u8 aBalanceQuickSpace[13];
+  /* 4-byte child pointer + up to a 19-byte (wide) or 9-byte (narrow) key
+  ** varint -- see balance_quick()'s use of this buffer, and putVarint128()'s
+  ** comment in util.c for the 19-byte wide-varint cap. Always sized for the
+  ** wide case: this is a small on-stack buffer, so there's no reason to
+  ** make its size conditional on BTS_WIDE_ROWID (unlike the on-disk-format
+  ** decisions this flag otherwise gates). */
+  u8 aBalanceQuickSpace[23];
   u8 *pFree = 0;
 
   VVA_ONLY( int balance_quick_called = 0 );
@@ -10998,8 +11062,8 @@ static int btreeHeapPull(u32 *aHeap, u32 *pOut){
 static int checkTreePage(
   IntegrityCk *pCheck,  /* Context for the sanity check */
   Pgno iPage,           /* Page number of the page to check */
-  i64 *piMinKey,        /* Write minimum integer primary key here */
-  i64 maxKey            /* Error if integer primary key greater than this */
+  rowid_t *piMinKey,    /* Write minimum integer primary key here */
+  rowid_t maxKey        /* Error if integer primary key greater than this */
 ){
   MemPage *pPage = 0;      /* The page being analyzed */
   int i;                   /* Loop counter */
@@ -11130,15 +11194,23 @@ static int checkTreePage(
 
     /* Check for integer primary key out of range
     **
-    ** maxKey/piMinKey stay plain i64 here (integrity-check bookkeeping,
-    ** not itself part of the on-disk format); rowidToI64() is safe as
-    ** long as every cell parser only ever produces narrow keys, which
-    ** holds until the wide on-disk codec exists. Revisit alongside that
-    ** work. */
+    ** maxKey/piMinKey are now rowid_t (this integrity-check function's own
+    ** bookkeeping, not itself part of the on-disk format, but must still
+    ** be full-width to correctly order a narrow-fixed-width-PK-as-rowid
+    ** (README.md) table's high-aligned rowid_t values -- see rowidCompare()).
+    ** This USED TO be plain i64, with a comment noting rowidToI64() (which
+    ** asserts the value fits in 64 bits) was "safe as long as every cell
+    ** parser only ever produces narrow keys, which holds until the wide
+    ** on-disk codec exists" -- that codec now exists (Phase 1) and this is
+    ** exactly the "revisit alongside that work" the comment called for.
+    ** Pre-existing wide-rowid-foundation bug (not narrow-PK-specific in
+    ** root cause -- ANY table whose keys use the high-aligned/wide range
+    ** exposes it), tracked in README.md §5b. */
     if( pPage->intKey ){
-      i64 iKey = rowidToI64(info.nKey);
-      if( keyCanBeEqual ? (iKey > maxKey) : (iKey >= maxKey) ){
-        checkAppendMsg(pCheck, "Rowid %lld out of order", iKey);
+      rowid_t iKey = info.nKey;
+      if( keyCanBeEqual ? rowidGt(iKey, maxKey) : rowidGe(iKey, maxKey) ){
+        checkAppendMsg(pCheck, "Rowid %lld out of order",
+                        (long long)rowidTruncateToI64(iKey));
       }
       maxKey = iKey;
       keyCanBeEqual = 0;     /* Only the first key on the page may ==maxKey */
@@ -11394,14 +11466,14 @@ int sqlite3BtreeIntegrityCheck(
   for(i=0; (int)i<nRoot && sCheck.mxErr; i++){
     sCheck.nRow = 0;
     if( aRoot[i] ){
-      i64 notUsed;
+      rowid_t notUsed;
 #ifndef SQLITE_OMIT_AUTOVACUUM
       if( pBt->autoVacuum && aRoot[i]>1 && !bPartial ){
         checkPtrmap(&sCheck, aRoot[i], PTRMAP_ROOTPAGE, 0);
       }
 #endif
       sCheck.v0 = aRoot[i];
-      checkTreePage(&sCheck, aRoot[i], &notUsed, LARGEST_INT64);
+      checkTreePage(&sCheck, aRoot[i], &notUsed, rowidLargest());
     }
     sqlite3MemSetArrayInt64(aCnt, i, sCheck.nRow);
   }

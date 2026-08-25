@@ -460,8 +460,10 @@ forward, with step 1 already done.
 Confirmed, reproducible bugs under `SQLITE_128BIT_ROWID`, found via a dedicated audit pass (not
 part of the numbered step-by-step plan in §3, and not speculative follow-up work like §4 — these are
 concrete, verified defects). Kept separate and explicit so they aren't lost track of. None of these
-affect a default (non-`SQLITE_128BIT_ROWID`) build. §5a (this fork's own narrow-PK bugs) is now fully
-fixed; §5b (pre-existing foundation bugs, unrelated to narrow-PK) remains open.
+affect a default (non-`SQLITE_128BIT_ROWID`) build. §5a (this fork's own narrow-PK bugs) is fully
+fixed; §5b (pre-existing foundation bugs, unrelated to narrow-PK) has its two most impactful bugs
+fixed (2026-08-25) — see §5b's own subsections for what's fixed vs. still open, and a triage-based
+plan for the rest.
 
 ### 5a. Narrow-PK feature bugs (this fork's own code) — all fixed (step 11)
 
@@ -534,30 +536,100 @@ and the established regression file set (27 files, incl. all `vacuum*.test`, `al
 Found incidentally while testing the narrow-PK feature (steps 6, 7, 8, 10a), each confirmed via
 `git stash` A/B testing to reproduce identically with none of this feature's code present — i.e.
 these are gaps in the wide-rowid foundation (step 1) itself, or in wholly unrelated subsystems,
-predating and unrelated to narrow-PK-as-rowid. None investigated beyond confirming they predate this
-feature; each would need its own root-cause pass.
+predating and unrelated to narrow-PK-as-rowid. Originally catalogued without root-causing; a
+follow-up audit (2026-08-25) root-caused and fixed the two most impactful items (below), which
+turned out to resolve the large majority of the originally-listed test failures as a side effect.
 
-- `PRAGMA integrity_check` reports a false "Rowid N out of order" for *any* narrow-PK table (not just
-  ones with a secondary index) — `btree.c`'s `checkTreePage()` uses the assert-on-overflow
-  `rowidToI64()` instead of the safe `rowidTruncateToI64()` on table b-tree cell keys, which can't
-  represent a narrow-PK rowid_t's high-aligned embedding. (This one specifically involves narrow-PK
-  data, but the defect is in generic, pre-existing integrity-check code, not in this fork's own
-  narrow-PK code paths — hence listed here rather than in §5a.)
-- `test/boundary1.test`, `test/boundary3.test`, `test/boundary4.test` — huge plain-`INTEGER` rowid
-  values.
-- `ext/fts5/test/fts5contentless2.test`, `fts5origintext4.test` — FTS5's internal rowid bookkeeping.
-- `test/amatch1.test`, `test/altercorrupt.test` — corruption-recovery paths.
-- Several `ext/recover/*` tests, `ext/rtree/rtreefuzz001.test` — recovery/R-tree fuzz corpora.
-- `test/vacuum6.test`, `test/decimal.test`, `test/resetdb.test`, `test/gencol1.test`, one sub-case of
-  `test/pragma.test`, `test/dbfuzz001.test`, `test/filefmt.test`, `test/sort5.test`,
-  `test/incrvacuum.test`, `test/pagesize.test`, `test/ovfl.test`, plus clusters of `corruptL`/
-  `corruptN`/`dbpage`/`diskfull`/`fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases — surfaced by
-  step 10a's `veryquick.test` run, the first one in this project's history to ever run to completion
-  under `SQLITE_128BIT_ROWID` (every earlier attempt was cut off partway through before reaching
-  these test files).
+#### Fixed (2026-08-25)
 
-Worth a dedicated audit pass of its own before considering `SQLITE_128BIT_ROWID` production-ready for
-anything beyond this fork's own narrow-PK feature.
+- **`btree.c`'s two fast-path table-b-tree cell-size functions (`cellSizePtrTableLeaf()` and
+  `cellSizePtrNoPayload()`) hardcoded a 9-byte-max scan for the rowid key varint** — correct for the
+  legacy narrow encoding (`sqlite3PutVarint()`'s own 9-byte cap) but not for a wide
+  (`SQLITE_128BIT_ROWID`) file, where a key varint can need up to 19 bytes (`putVarint128()`, added
+  in step 1). This silently *under-reported* the size of any table-leaf or interior cell whose key
+  varint genuinely needed more than 9 bytes — not a narrow-PK-specific trigger:
+  `rowidFromI64()`'s sign-extension means **any negative classic `INTEGER PRIMARY KEY` rowid** needs
+  the full 19-byte form too. `cellSizePtrTableLeaf()` in particular is the size function for *every*
+  table-leaf cell — the single most heavily used function in this whole class — making this the
+  dominant cause of "database disk image is malformed" across the board. Each function's own
+  `SQLITE_DEBUG` assert (comparing its fast-path result against `xParseCell`'s full, already-correct
+  parse) would have caught this immediately in a debug build; it was only reachable in a build
+  without debug assertions compiled in, and no `SQLITE_128BIT_ROWID` debug-build test run had
+  apparently ever been done before. Root-caused by bisecting `test/boundary1.test`'s failure (64
+  rows with boundary-value rowids: count dropped from 64 to 32 once real per-row payload made the
+  leaf page split into multiple pages — tiny/empty payloads that fit on one page never triggered it)
+  down to specific functions by reading `btreeParseCellPtrNoPayload()` (the correct, width-aware
+  "ground truth" parser) side-by-side with its fast-path counterpart. Fixed by widening the cap to
+  19 bytes whenever `pBt->btsFlags & BTS_WIDE_ROWID`. **Impact:** alone, resolved
+  `test/boundary1.test` (1000/1096 failures → 0/1512), `test/boundary3.test` (1000/1066 → 0/1897),
+  `test/boundary4.test` (23/55 → 0/55), `test/decimal.test` (2/50 → 0/50), and
+  `ext/fts5/test/fts5contentless2.test` (crashed before completing → 0/426) entirely.
+- **`btree.c`'s `balance_quick()`** (the b-tree append-fast-path used when inserting new rows at the
+  end of a table) had the *same* hardcoded 9-byte cap in its own inline divider-cell-key copy, *and*
+  its caller's `aBalanceQuickSpace[13]` stack buffer (4-byte child pointer + 9-byte key) was too
+  small to ever hold a 19-byte wide key even if the cap were fixed. Fixed by widening both the
+  buffer (to 23 bytes) and the cap (to 19, matching the two functions above). A real bug, confirmed
+  via code reading (the same "must match `sqlite3PutVarintRowid()`'s wide/narrow codec choice"
+  requirement the two functions above already documented for their own analogous caps), though it
+  turned out not to be independently observable in this audit's specific test corpus (the
+  cell-size fixes above, on their own, already resolved every test this specific bug could have
+  contributed to) — kept as its own fix rather than left in place, since it is unambiguously the
+  same defect and would eventually surface with a large-enough sequential/append-heavy wide-rowid
+  workload.
+- **`PRAGMA integrity_check` reported a false "Rowid N out of order" for *any* narrow-PK table** —
+  `btree.c`'s `checkTreePage()` used `i64`-typed `maxKey`/`piMinKey` bookkeeping (with the
+  assert-on-overflow `rowidToI64()`) for its ascending-key-order check, which cannot represent a
+  narrow-PK rowid_t's high-aligned embedding at all (its own comment predicted this: "safe as long
+  as every cell parser only ever produces narrow keys, which holds until the wide on-disk codec
+  exists... revisit alongside that work" — that codec has existed since step 1). Beyond just an
+  overflow risk, simply swapping in `rowidTruncateToI64()` (the non-asserting narrowing used
+  elsewhere) would not have been sufficient: it keeps only the *low* 64 bits, which for a
+  high-aligned narrow-PK embedding are almost always zero, defeating the actual ordering check (this
+  matches the originally-observed symptom exactly: every row reported literal "Rowid 0"). Fixed by
+  widening `maxKey`/`piMinKey` to `rowid_t` and the comparison to `rowidCompare()` (via the existing
+  `rowidGt()`/`rowidGe()` helpers), plus a new `rowidLargest()` helper (`sqliteInt.h`) for the
+  top-level entry call's "no maximum yet" bound — deliberately *not* `rowidFromI64(LARGEST_INT64)`,
+  which a narrow-PK table's high-aligned values can legitimately and correctly exceed.
+- All four fixes verified with the established 27-file regression suite plus the 15-file general
+  comparison/index/vacuum sanity set (42 files total), clean under both a default build and
+  `SQLITE_128BIT_ROWID`, plus a full `quicktest` run for the default build (given how central
+  `cellSizePtrTableLeaf()` is to ordinary, non-wide-rowid operation) and re-triage of every
+  originally-listed §5b test file.
+
+#### Still open
+
+Re-triaged after the fixes above (still under `SQLITE_128BIT_ROWID`, same test files as originally
+listed) — most items resolved as a side effect of the two fixes; what's left:
+
+- `test/amatch1.test`, `test/vacuum6.test`, `test/resetdb.test`, `test/gencol1.test`,
+  `test/dbfuzz001.test`, `test/filefmt.test`, `test/sort5.test`, `test/incrvacuum.test`,
+  `test/pagesize.test`, `test/ovfl.test`, `ext/fts5/test/fts5origintext4.test`,
+  `ext/rtree/rtreefuzz001.test` — still fail, error counts unchanged by the fixes above, not yet
+  root-caused. `test/resetdb.test`/`gencol1.test`/`dbfuzz001.test` fail with a *different* symptom
+  ("attempt to write a readonly database" rather than "disk image is malformed"), suggestive of a
+  distinct bug (or possibly a test-fixture/environment issue rather than a product bug — not yet
+  determined) from the "disk image is malformed" cluster the rest share.
+- `test/altercorrupt.test` — unchanged error count (2/5); may be exercising *expected* corrupt-input
+  handling whose exact diagnostics differ under wide rowids rather than a genuine bug — not yet
+  determined either way.
+- Several `ext/recover/*` tests — not re-triaged in this pass (excluded from the 2026-08-25 run for
+  time; still only originally confirmed pre-existing, not root-caused).
+- Two other clusters from step 10a's original `veryquick.test` run, not re-triaged in this pass:
+  `test/pragma.test` (one sub-case), and a larger cluster of `corruptL`/`corruptN`/`dbpage`/
+  `diskfull`/`fts3corrupt4`/`fts4aa`/`fts3fuzz001`/`fts3query` cases.
+
+**Suggested next steps, roughly in priority order:** (1) re-triage the still-open "disk image is
+malformed" cluster (`amatch1`, `vacuum6`, `sort5`, `pagesize`, `ovfl`, `fts5origintext4`,
+`rtreefuzz001`, `filefmt`, `incrvacuum`) the same way `boundary1.test` was bisected here — payload
+size and page-split/page-type variations (an *index* b-tree's analogous fast-path functions,
+`cellSizePtrIdxLeaf`/`cellSizePtr`, were not audited in this pass and are a natural place to look
+next, alongside `balance_nonroot()`'s own cell-copying code, which was not fully audited either); (2)
+determine whether the `resetdb`/`gencol1`/`dbfuzz001` "readonly database" cluster is a real bug or a
+test-environment artifact; (3) the `ext/recover/*`/R-tree/FTS3/FTS4 corpora and `altercorrupt.test`,
+lowest priority since they're the most likely to be exercising deliberately-corrupt input where
+some divergence in diagnostics (rather than a genuine defect) is plausible. Worth a dedicated
+follow-up audit pass before considering `SQLITE_128BIT_ROWID` production-ready for anything beyond
+this fork's own narrow-PK feature.
 
 ## 6. Attribution
 

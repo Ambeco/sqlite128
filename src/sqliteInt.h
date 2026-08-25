@@ -1006,6 +1006,29 @@ static SQLITE_INLINE int rowidLe(rowid_t a, rowid_t b){ return rowidCompare(a,b)
 static SQLITE_INLINE int rowidGt(rowid_t a, rowid_t b){ return rowidCompare(a,b)>0; }
 static SQLITE_INLINE int rowidGe(rowid_t a, rowid_t b){ return rowidCompare(a,b)>=0; }
 static SQLITE_INLINE int rowidIsNeg(rowid_t a){ return rowidLt(a, rowidFromI64(0)); }
+/*
+** rowidLargest(): the largest value a rowid_t can hold under rowidCompare()'s
+** signed ordering -- LARGEST_INT64 (sqliteInt.h) in a default build, or the
+** analogous 128-bit value (2^127-1) under SQLITE_128BIT_ROWID. NOT the same
+** as rowidFromI64(LARGEST_INT64): that only occupies the low 64 bits (hi=0),
+** which a narrow-fixed-width-PK-as-rowid (README.md) high-aligned embedding
+** can legitimately exceed (e.g. any BLOB/TEXT value whose first byte's
+** flipped top bit is 1 -- see rowidFromNarrowBytes()) -- using it as an
+** "effectively infinite" upper bound would be wrong for those tables. Used
+** by btree.c's checkTreePage() as its root-level "no maximum yet" bound.
+*/
+#ifdef SQLITE_128BIT_ROWID
+  static SQLITE_INLINE rowid_t rowidLargest(void){
+    return int128Sub(int128ShiftLeft(int128FromU64(1),127), int128FromU64(1));
+  }
+#else
+  /* Same value as LARGEST_INT64 (defined later in this file) -- spelled
+  ** out here instead of using that name, since macros can't be forward-
+  ** referenced and this needs to sit next to rowidIsNeg() above. */
+  static SQLITE_INLINE rowid_t rowidLargest(void){
+    return (i64)(0xffffffff|(((i64)0x7fffffff)<<32));
+  }
+#endif
 #ifdef SQLITE_128BIT_ROWID
   static SQLITE_INLINE rowid_t rowidAdd1(rowid_t a){ return int128Increment(a); }
   static SQLITE_INLINE rowid_t rowidSub1(rowid_t a){ return int128Decrement(a); }
