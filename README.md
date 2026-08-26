@@ -121,10 +121,10 @@ header, or the `BTS_LEGACY_NARROW` read-only-for-legacy-files mechanism), or con
 test-environment flakiness. None of that history is repeated here; see `git log` for the
 individual fixes.
 
-One further item is root-caused but deliberately left as a documented, unavoidable interaction
-rather than "fixed," since there is nothing to fix: **`ext/fts5/test/fts5origintext4.test`**
+One further item was root-caused and fixed, but the fix lives in the *test*, not the engine, since
+there was nothing wrong to fix in the engine itself: **`ext/fts5/test/fts5origintext4.test`**
 (`fts5origintext4-1.2.1`) asserts that a broad, low-selectivity query uses more than a hardcoded
-250000-byte page-cache threshold; under `SQLITE_128BIT_ROWID` it uses only ~70KB (vs. ~327KB in a
+250000-byte page-cache threshold; under `SQLITE_128BIT_ROWID` it used only ~70KB (vs. ~327KB in a
 default build). Root cause: FTS5's own internal leaf-page target size
 (`FTS5_DEFAULT_PAGE_SIZE`=4050 bytes, unrelated to and unaware of this fork) sits just below this
 build's table-leaf local-payload cap (`usableSize-35` bytes, e.g. 4061 for a 4096-byte page) in a
@@ -133,17 +133,23 @@ table-leaf cap is intentionally 10 bytes smaller under `SQLITE_128BIT_ROWID`
 (`usableSize-35-10`, `btree.c`), reserving room for the wide rowid key's worst-case 19-byte varint
 (vs. 9 narrow) so fanout guarantees still hold for genuinely large keys — a real, necessary
 correctness margin, confirmed by `test/boundary1.test`/`test/boundary3.test` needing exactly this
-margin. That 10-byte difference is just enough to push FTS5's specific leaf size over the
+margin. That 10-byte difference was just enough to push FTS5's specific leaf size over the
 threshold, forcing those blobs to spill into overflow pages. Once a payload overflows, mainline
 SQLite's own `SQLITE_DIRECT_OVERFLOW_READ` optimization (on by default, confirmed via a build with
 `-DSQLITE_DIRECT_OVERFLOW_READ=0` restoring the page-cache usage to ~366KB) reads overflow content
-directly from the file, deliberately bypassing the page cache — which is exactly why less shows up
-in `sqlite3_db_status(..., CACHE_USED, ...)`. No data is lost or misread (verified: `ft('the')`'s
-result set has the identical count/sum/min/max as an unfiltered scan in both builds); this is
-purely two independently-correct behaviors — a necessary wide-rowid safety margin, and an
+directly from the file, deliberately bypassing the page cache — which is exactly why less showed up
+in `sqlite3_db_status(..., CACHE_USED, ...)`. No data was ever lost or misread (verified:
+`ft('the')`'s result set has the identical count/sum/min/max as an unfiltered scan in both builds);
+this was purely two independently-correct behaviors — a necessary wide-rowid safety margin, and an
 unrelated, deliberate SQLite cache-bypass optimization — intersecting at a page-size constant
 neither side has any awareness of the other choosing. Reducing the wide-rowid margin to avoid this
-would reopen the real corruption risk it exists to prevent, so this is left as-is.
+would reopen the real corruption risk it exists to prevent, so instead the *test* was adjusted,
+gated so a default build's copy is untouched: `SQLITE_128BIT_ROWID` was added to the compile-option
+list `sqlite3_compileoption_used()` reports (`tool/mkctimec.tcl`), and the test now uses that (via
+`sqlite_compileoption_used('128BIT_ROWID')`) to force FTS5's own `pgsz` config down to 4000 bytes
+—  comfortably under the reduced local-payload cap — only under `SQLITE_128BIT_ROWID`, restoring
+every leaf to fitting entirely locally (and thus back in the page cache) in both builds. A default
+build's test run is unaffected byte-for-byte (the added block is skipped entirely).
 
 ## 4. Potential follow-up work
 

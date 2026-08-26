@@ -103,6 +103,7 @@ set boolean_defnnz_options {
 # All Boolean compile time options which default to 0 or empty.
 #
 set boolean_defnil_options {
+  SQLITE_128BIT_ROWID
   SQLITE_32BIT_ROWID
   SQLITE_4_BYTE_ALIGNED_MALLOC
   SQLITE_ALLOW_ROWID_IN_VIEW

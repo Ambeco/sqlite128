@@ -42,6 +42,27 @@ do_execsql_test 1.0 {
   );
 }
 
+# Under the sqlite128 fork's SQLITE_128BIT_ROWID build, a table b-tree leaf
+# cell's local-payload cap is 10 bytes smaller than in a default build (room
+# is reserved for a rowid's worst-case 19-byte wide varint key, vs. 9 bytes
+# narrow -- see that fork's README.md, section 2/3). FTS5's own internal
+# leaf-page target (~4050 bytes, unrelated to and unaware of any of this)
+# sits just above the reduced cap, so leaves that fit entirely on their own
+# b-tree page in a default build spill into overflow pages here -- and
+# SQLite's own SQLITE_DIRECT_OVERFLOW_READ optimization then reads that
+# overflow content straight from the file, bypassing the very page cache
+# the assertions below measure. Force a smaller internal FTS5 page size so
+# every leaf still fits entirely locally in both builds, matching the
+# comparison this file actually intends to make. A default (non-wide) build
+# is completely unaffected -- sqlite_compileoption_used() reports false and
+# this block is skipped entirely, leaving the file's behavior identical to
+# upstream.
+if {[db one {SELECT sqlite_compileoption_used('128BIT_ROWID')}]} {
+  do_execsql_test 1.0.pgsz {
+    INSERT INTO ft(ft, rank) VALUES('pgsz', 4000);
+  }
+}
+
 do_execsql_test 1.1 {
   BEGIN;
     INSERT INTO ft SELECT 'the first thing';
