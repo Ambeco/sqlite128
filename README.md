@@ -99,76 +99,9 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
 
 The design in §1/§2 is fully implemented for both widths (up to 8 bytes in any build, up to 16
 bytes under `SQLITE_128BIT_ROWID`), including secondary indexes on a narrow-PK table. There are no
-known open bugs as of this writing; the two most recent were both root-caused and fixed:
-
-- **The near-miss heuristic used to fire on ordinary, non-narrow-PK schemas — fixed.** `build.c`'s
-  `narrowPKFinalize()` used to treat *any* width annotation on a `PRIMARY KEY`'s declared type
-  (`TEXT(36)`, `VARCHAR(50)`, etc.) as a narrow-PK "near miss," even with no `CHECK` constraint on
-  the column at all. Width-annotated primary keys with no such `CHECK` are an extremely common,
-  ordinary, mainline-compatible pattern (e.g. schemas ported from other databases) — this fork used
-  to reject them outright (`CREATE TABLE t(id text(36) not null primary key, v text)` raised a
-  near-miss error with no `CHECK` anywhere in the statement; confirmed fork-introduced, not
-  pre-existing, via `test/tkt1449.test`). Fixed by requiring an actual narrow-PK-shaped `CHECK` on
-  the column itself before treating it as a near-miss, never a bare width annotation alone.
-- **A deeper, related bug found while fixing the above: CHECK-constraint matching used the
-  candidate column's *position*, not its identity — fixed.** `narrowPKFinalize()` ran (and, for
-  correctness reasons explained below, still must run) *before* `sqlite3ResolveSelfReference()`
-  resolves `CHECK` constraints, so every one of its old column-reference checks compared against an
-  `Expr.iColumn` that was simply unresolved — reading as its zero-initialized default of `0`, not a
-  real column index. Every hand-written test case up to this point happened to put the narrow-PK
-  candidate column *first* in the table, so this was invisible: index `0` "coincidentally" matched.
-  Two concrete, confirmed failure modes once a table didn't fit that pattern: (a) a genuinely
-  correct narrow-PK schema silently failed to qualify — falling back to an ordinary index with no
-  error — whenever its candidate column wasn't the table's first column; (b) an unrelated `CHECK` on
-  a *different* column could be silently misattributed to the candidate, letting a column with no
-  `CHECK` of its own incorrectly qualify as the rowid alias. Fixed by matching `CHECK` constraints
-  against the candidate by column *name* (comparing the raw, still-unresolved identifier text)
-  instead of a resolved index — sidesteps the ordering requirement entirely, since it needs no
-  resolution at all. (The ordering itself is retained deliberately, not accidentally: a
-  self-referencing `CHECK` on a column that ends up qualifying must resolve to the rowid sentinel,
-  `Expr.iColumn=-1`, which mainline's own name resolution only produces when `Table.iPKey` already
-  reflects that outcome — resolving `CHECK`s any earlier, before that decision, was tried and
-  confirmed to silently break `CHECK` enforcement at `INSERT` time on every qualifying narrow-PK
-  table, even the simplest one-column case.)
-
-Everything else originally suspected of being a `SQLITE_128BIT_ROWID` bug — across `btree.c`'s
-cell-size and balancing code, `PRAGMA integrity_check`, `newDatabase()`'s meta-page setup,
-`ext/recover/*`'s interaction with a wrapper VFS, and large swaths of `test/pragma.test` and the
-`corruptL`/`corruptN`/`dbpage`/`diskfull`/`fts3corrupt4`/`fts3fuzz001` test clusters — has been
-triaged to one of: already fixed, intentional by-design behavior (this fork's own wide magic
-header, or the `BTS_LEGACY_NARROW` read-only-for-legacy-files mechanism), or confirmed transient
-test-environment flakiness. None of that history is repeated here; see `git log` for the
-individual fixes.
-
-One further item was root-caused and fixed, but the fix lives in the *test*, not the engine, since
-there was nothing wrong to fix in the engine itself: **`ext/fts5/test/fts5origintext4.test`**
-(`fts5origintext4-1.2.1`) asserts that a broad, low-selectivity query uses more than a hardcoded
-250000-byte page-cache threshold; under `SQLITE_128BIT_ROWID` it used only ~70KB (vs. ~327KB in a
-default build). Root cause: FTS5's own internal leaf-page target size
-(`FTS5_DEFAULT_PAGE_SIZE`=4050 bytes, unrelated to and unaware of this fork) sits just below this
-build's table-leaf local-payload cap (`usableSize-35` bytes, e.g. 4061 for a 4096-byte page) in a
-default build, so FTS5's ~4051-4055-byte leaf blobs fit entirely locally — but this fork's
-table-leaf cap is intentionally 10 bytes smaller under `SQLITE_128BIT_ROWID`
-(`usableSize-35-10`, `btree.c`), reserving room for the wide rowid key's worst-case 19-byte varint
-(vs. 9 narrow) so fanout guarantees still hold for genuinely large keys — a real, necessary
-correctness margin, confirmed by `test/boundary1.test`/`test/boundary3.test` needing exactly this
-margin. That 10-byte difference was just enough to push FTS5's specific leaf size over the
-threshold, forcing those blobs to spill into overflow pages. Once a payload overflows, mainline
-SQLite's own `SQLITE_DIRECT_OVERFLOW_READ` optimization (on by default, confirmed via a build with
-`-DSQLITE_DIRECT_OVERFLOW_READ=0` restoring the page-cache usage to ~366KB) reads overflow content
-directly from the file, deliberately bypassing the page cache — which is exactly why less showed up
-in `sqlite3_db_status(..., CACHE_USED, ...)`. No data was ever lost or misread (verified:
-`ft('the')`'s result set has the identical count/sum/min/max as an unfiltered scan in both builds);
-this was purely two independently-correct behaviors — a necessary wide-rowid safety margin, and an
-unrelated, deliberate SQLite cache-bypass optimization — intersecting at a page-size constant
-neither side has any awareness of the other choosing. Reducing the wide-rowid margin to avoid this
-would reopen the real corruption risk it exists to prevent, so instead the *test* was adjusted,
-gated so a default build's copy is untouched: `SQLITE_128BIT_ROWID` was added to the compile-option
-list `sqlite3_compileoption_used()` reports (`tool/mkctimec.tcl`), and the test now uses that (via
-`sqlite_compileoption_used('128BIT_ROWID')`) to force FTS5's own `pgsz` config down to 4000 bytes
-—  comfortably under the reduced local-payload cap — only under `SQLITE_128BIT_ROWID`, restoring
-every leaf to fitting entirely locally (and thus back in the page cache) in both builds. A default
-build's test run is unaffected byte-for-byte (the added block is skipped entirely).
+known open bugs as of this writing. See `git log` for the history of bugs found and fixed along the
+way (including in `narrowPKFinalize()`'s near-miss heuristic and CHECK-constraint matching, and in
+FTS5's page-cache test behavior under wide rowids).
 
 ## 4. Potential follow-up work
 
