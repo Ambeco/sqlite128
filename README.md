@@ -98,19 +98,38 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
 ## 3. Remaining work
 
 The design in §1/§2 is fully implemented for both widths (up to 8 bytes in any build, up to 16
-bytes under `SQLITE_128BIT_ROWID`), including secondary indexes on a narrow-PK table. What remains
-is a single confirmed, reproducible bug — not unimplemented design:
+bytes under `SQLITE_128BIT_ROWID`), including secondary indexes on a narrow-PK table. There are no
+known open bugs as of this writing; the two most recent were both root-caused and fixed:
 
-- **The near-miss heuristic fires on ordinary, non-narrow-PK schemas.** `build.c`'s
-  `narrowPKFinalize()` treats *any* width annotation on a `PRIMARY KEY`'s declared type
+- **The near-miss heuristic used to fire on ordinary, non-narrow-PK schemas — fixed.** `build.c`'s
+  `narrowPKFinalize()` used to treat *any* width annotation on a `PRIMARY KEY`'s declared type
   (`TEXT(36)`, `VARCHAR(50)`, etc.) as a narrow-PK "near miss," even with no `CHECK` constraint on
   the column at all. Width-annotated primary keys with no such `CHECK` are an extremely common,
-  ordinary, mainline-compatible pattern (e.g. schemas ported from other databases) — this fork
-  currently rejects them outright. Minimal repro: `CREATE TABLE t(id text(36) not null primary
-  key, v text)` raises a near-miss error with no `CHECK` anywhere in the statement. Confirmed
-  fork-introduced (not pre-existing) via `test/tkt1449.test`. Likely fix: require an actual
-  narrow-PK-shaped `CHECK` hit before treating a column as a near-miss, not a bare width
-  annotation on the declared type.
+  ordinary, mainline-compatible pattern (e.g. schemas ported from other databases) — this fork used
+  to reject them outright (`CREATE TABLE t(id text(36) not null primary key, v text)` raised a
+  near-miss error with no `CHECK` anywhere in the statement; confirmed fork-introduced, not
+  pre-existing, via `test/tkt1449.test`). Fixed by requiring an actual narrow-PK-shaped `CHECK` on
+  the column itself before treating it as a near-miss, never a bare width annotation alone.
+- **A deeper, related bug found while fixing the above: CHECK-constraint matching used the
+  candidate column's *position*, not its identity — fixed.** `narrowPKFinalize()` ran (and, for
+  correctness reasons explained below, still must run) *before* `sqlite3ResolveSelfReference()`
+  resolves `CHECK` constraints, so every one of its old column-reference checks compared against an
+  `Expr.iColumn` that was simply unresolved — reading as its zero-initialized default of `0`, not a
+  real column index. Every hand-written test case up to this point happened to put the narrow-PK
+  candidate column *first* in the table, so this was invisible: index `0` "coincidentally" matched.
+  Two concrete, confirmed failure modes once a table didn't fit that pattern: (a) a genuinely
+  correct narrow-PK schema silently failed to qualify — falling back to an ordinary index with no
+  error — whenever its candidate column wasn't the table's first column; (b) an unrelated `CHECK` on
+  a *different* column could be silently misattributed to the candidate, letting a column with no
+  `CHECK` of its own incorrectly qualify as the rowid alias. Fixed by matching `CHECK` constraints
+  against the candidate by column *name* (comparing the raw, still-unresolved identifier text)
+  instead of a resolved index — sidesteps the ordering requirement entirely, since it needs no
+  resolution at all. (The ordering itself is retained deliberately, not accidentally: a
+  self-referencing `CHECK` on a column that ends up qualifying must resolve to the rowid sentinel,
+  `Expr.iColumn=-1`, which mainline's own name resolution only produces when `Table.iPKey` already
+  reflects that outcome — resolving `CHECK`s any earlier, before that decision, was tried and
+  confirmed to silently break `CHECK` enforcement at `INSERT` time on every qualifying narrow-PK
+  table, even the simplest one-column case.)
 
 Everything else originally suspected of being a `SQLITE_128BIT_ROWID` bug — across `btree.c`'s
 cell-size and balancing code, `PRAGMA integrity_check`, `newDatabase()`'s meta-page setup,
@@ -170,7 +189,6 @@ build's test run is unaffected byte-for-byte (the added block is skipped entirel
   a table keyed by a content hash get the same compact table-b-tree treatment. Not scoped or
   started; would need its own width-generalization pass through the `sqlite3_uint128`-shaped
   arithmetic/comparison/storage layers this fork already built for 128 bits.
-- **Known bugs.** See §3.
 
 ## 5. Attribution
 

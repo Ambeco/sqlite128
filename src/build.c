@@ -1888,9 +1888,10 @@ static u8 narrowPKTypeSpelling(Column *pCol, int *pW){
       while( sqlite3Isspace((unsigned char)z[n]) ) n++;
       if( z[n]==')' && z[n+1]==0 ) *pW = w;
       /* else: malformed/unusual suffix (e.g. "(10,2)" or trailing junk) --
-      ** leave *pW=-1. narrowPKFinalize() still treats ANY parenthesized
-      ** suffix (re-detected there via strchr, not via *pW) as a signal
-      ** even when it doesn't parse into a usable width. */
+      ** leave *pW=-1. This is not itself a signal either way: a width
+      ** specifier (parseable or not) is never sufficient on its own for
+      ** narrowPKFinalize() to treat the column as a near-miss -- see its
+      ** own comment for why. */
     }
   }
   return kind;
@@ -2750,27 +2751,37 @@ static void markExprListImmutable(ExprList *pList){
 
 /*
 ** Narrow-fixed-width-PK-as-rowid (README.md) CHECK-constraint matchers.
-** Operate only on an already-CHECK-resolved Expr (i.e. only ever called
-** after sqlite3ResolveSelfReference() has run on pTab->pCheck). Each
-** strict Match* function below requires the canonical syntactic form
+** Deliberately operate on the RAW, still-unresolved parse tree (still
+** TK_ID column references, not yet sqlite3ResolveSelfReference()-resolved
+** TK_COLUMN) -- see narrowPKFinalize()'s own comment for why resolved
+** Expr.iColumn can't be used here: this function runs, and must run,
+** BEFORE the official CHECK-constraint resolution, since resolving a
+** self-reference to the narrow-PK candidate correctly (Expr.iColumn=-1,
+** the rowid sentinel, rather than an ordinary column index) itself
+** depends on pTab->iPKey already reflecting THIS function's own decision.
+** Matching therefore compares the raw identifier token's TEXT against the
+** candidate column's name (sqlite3StrICmp, matching SQLite's own
+** case-insensitive identifier rules) instead of a resolved index --
+** unambiguous, since a CREATE TABLE statement can't declare two columns
+** with the same name, and entirely unaffected by resolution timing or by
+** which column index the candidate happens to be.
+**
+** Each strict Match* function below requires the canonical syntactic form
 ** only -- e.g. length(col)=16 with the function call as the LEFT operand
 ** and the integer/string literal as the RIGHT operand -- not reversed
 ** operands or other equivalent rewrites (deliberate MVP scoping).
 */
 
-/* True if e is a resolved reference to column iCol of the table under
-** construction. Verified empirically (not merely assumed) that CHECK-
-** constraint self-reference resolution (sqlite3ResolveSelfReference(),
-** NC_IsCheck) sets .iColumn correctly but -- unlike ordinary query
-** column resolution -- leaves .op as TK_ID rather than rewriting it to
-** TK_COLUMN; both forms must be accepted here. */
-static int narrowPKExprIsColumnRef(Expr *e, int iCol){
-  return (e->op==TK_COLUMN || e->op==TK_ID) && e->iColumn==iCol;
+/* True if e is an (unresolved) reference to the column named zColName. */
+static int narrowPKExprIsColumnRef(Expr *e, const char *zColName){
+  return e->op==TK_ID && sqlite3StrICmp(e->u.zToken, zColName)==0;
 }
 
-/* True if e is length(<col#iCol>)=<int> (bCastToBlob==0) or
-** length(CAST(<col#iCol> AS BLOB))=<int> (bCastToBlob!=0); sets *pW. */
-static int narrowPKMatchLengthEq(Expr *e, int iCol, int bCastToBlob, int *pW){
+/* True if e is length(<zColName>)=<int> (bCastToBlob==0) or
+** length(CAST(<zColName> AS BLOB))=<int> (bCastToBlob!=0); sets *pW. */
+static int narrowPKMatchLengthEq(
+  Expr *e, const char *zColName, int bCastToBlob, int *pW
+){
   Expr *fn, *arg;
   if( e->op!=TK_EQ ) return 0;
   if( !sqlite3ExprIsInteger(e->pRight, pW, 0) ) return 0;
@@ -2783,11 +2794,13 @@ static int narrowPKMatchLengthEq(Expr *e, int iCol, int bCastToBlob, int *pW){
     if( arg->op!=TK_CAST || sqlite3StrICmp(arg->u.zToken, "BLOB")!=0 ) return 0;
     arg = arg->pLeft;
   }
-  return narrowPKExprIsColumnRef(arg, iCol);
+  return narrowPKExprIsColumnRef(arg, zColName);
 }
 
-/* True if e is typeof(<col#iCol>)='<zExpectedType>'. */
-static int narrowPKMatchTypeofEq(Expr *e, int iCol, const char *zExpectedType){
+/* True if e is typeof(<zColName>)='<zExpectedType>'. */
+static int narrowPKMatchTypeofEq(
+  Expr *e, const char *zColName, const char *zExpectedType
+){
   Expr *fn, *arg;
   if( e->op!=TK_EQ ) return 0;
   if( e->pRight->op!=TK_STRING
@@ -2800,15 +2813,15 @@ static int narrowPKMatchTypeofEq(Expr *e, int iCol, const char *zExpectedType){
   if( sqlite3StrICmp(fn->u.zToken, "typeof")!=0 ) return 0;
   if( fn->x.pList==0 || fn->x.pList->nExpr!=1 ) return 0;
   arg = fn->x.pList->a[0].pExpr;
-  return narrowPKExprIsColumnRef(arg, iCol);
+  return narrowPKExprIsColumnRef(arg, zColName);
 }
 
 /* Loose match, used only to detect the near-miss SIGNAL: true if e is a
 ** call to length()/typeof() (optionally through a CAST) referencing
-** column iCol, regardless of comparison operator or operand order --
+** column zColName, regardless of comparison operator or operand order --
 ** unlike the strict Match* functions above, this does NOT establish that
 ** the CHECK actually qualifies, only that it looks like an attempt. */
-static int narrowPKExprIsLengthOrTypeofCall(Expr *e, int iCol){
+static int narrowPKExprIsLengthOrTypeofCall(Expr *e, const char *zColName){
   Expr *arg;
   if( e->op!=TK_FUNCTION || !ExprUseXList(e) ) return 0;
   if( sqlite3StrICmp(e->u.zToken,"length")!=0
@@ -2819,28 +2832,39 @@ static int narrowPKExprIsLengthOrTypeofCall(Expr *e, int iCol){
   if( e->x.pList==0 || e->x.pList->nExpr!=1 ) return 0;
   arg = e->x.pList->a[0].pExpr;
   if( arg->op==TK_CAST ) arg = arg->pLeft;
-  return narrowPKExprIsColumnRef(arg, iCol);
+  return narrowPKExprIsColumnRef(arg, zColName);
 }
-static int narrowPKExprMentionsColumn(Expr *e, int iCol){
+static int narrowPKExprMentionsColumn(Expr *e, const char *zColName){
   if( e->op!=TK_EQ && e->op!=TK_NE && e->op!=TK_LT
    && e->op!=TK_LE && e->op!=TK_GT && e->op!=TK_GE
   ){
     return 0;
   }
-  return narrowPKExprIsLengthOrTypeofCall(e->pLeft, iCol)
-      || narrowPKExprIsLengthOrTypeofCall(e->pRight, iCol);
+  return narrowPKExprIsLengthOrTypeofCall(e->pLeft, zColName)
+      || narrowPKExprIsLengthOrTypeofCall(e->pRight, zColName);
 }
 
 /*
 ** Narrow-fixed-width-PK-as-rowid (README.md) finalization. Called from
 ** sqlite3EndTable() whenever pTab->iNarrowPKCandidate>=0 (set earlier by
-** sqlite3AddPrimaryKey()), after CHECK-constraint resolution AND after
-** the STRICT-table datatype check (so a STRICT table's existing "unknown
-** datatype" error for a width-specified type like BLOB(16) -- STRICT
-** tables never allow type modifiers at all, a pre-existing, unrelated
-** mainline restriction -- is reported instead of a narrow-PK-specific
-** message; a bare BLOB/TEXT/REAL with no width specifier at all is
-** unaffected by that STRICT restriction and can still qualify).
+** sqlite3AddPrimaryKey()), after the STRICT-table datatype check (so a
+** STRICT table's existing "unknown datatype" error for a width-specified
+** type like BLOB(16) -- STRICT tables never allow type modifiers at all,
+** a pre-existing, unrelated mainline restriction -- is reported instead
+** of a narrow-PK-specific message; a bare BLOB/TEXT/REAL with no width
+** specifier at all is unaffected by that STRICT restriction and can
+** still qualify). This single call site runs BEFORE CHECK-constraint
+** resolution (sqlite3ResolveSelfReference() hasn't touched pTab->pCheck
+** yet) -- see the call site's own comment in sqlite3EndTable() for why
+** that ordering is required (not just tolerated) for BOTH outcomes: it's
+** what lets convertToWithoutRowidTable() below see an already-settled
+** iPKey/PRIMARY KEY index for a WITHOUT ROWID table, and what lets a
+** self-referencing CHECK on a column that DOES qualify resolve correctly
+** to the rowid sentinel (Expr.iColumn=-1) instead of a stale ordinary
+** column index. Because of this, narrowPKFinalize()'s own CHECK-matching
+** (narrowPKMatchLengthEq() et al, via narrowPKExprIsColumnRef()) matches
+** by column NAME against the raw, still-unresolved parse tree, not by a
+** resolved Expr.iColumn -- see narrowPKExprIsColumnRef()'s own comment.
 **
 ** Resolves the pending candidate into exactly one of:
 **   (a) qualifies -- set iPKey/keyConf/tabFlags/pKeyWidth, no index built
@@ -2855,6 +2879,20 @@ static int narrowPKExprMentionsColumn(Expr *e, int iCol){
 **       stay lenient) -- silently fall back to building the ordinary
 **       unique index sqlite3AddPrimaryKey() would have built immediately
 **       in mainline.
+**
+** What counts as a "signal": only an actual CHECK constraint that mentions
+** this column and is shaped like (or close to) what this optimization
+** requires -- a `length()`/`typeof()` call on the column, in any comparison,
+** regardless of whether it ends up matching the exact required form. A bare
+** width specifier on the declared type (e.g. `TEXT(36)`) is deliberately
+** NOT a signal by itself, even though this optimization's own qualifying
+** syntax also uses one: `TEXT(N)`/`VARCHAR(N)`-style width annotations
+** with no CHECK at all are an extremely common, ordinary, mainline-
+** compatible pattern (e.g. schemas ported from other databases -- see
+** README.md §3's history of `test/tkt1449.test`), and this fork must not
+** turn that into a hard error just because the type happens to be exactly
+** `TEXT`/`BLOB`/`REAL`. A width specifier alone doesn't ever change the
+** near-miss verdict either way -- see narrowPKTypeSpelling()'s own comment.
 */
 static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
   sqlite3 *db = pParse->db;
@@ -2871,8 +2909,12 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
   pTab->pNarrowPKList = 0;
   int wType;                       /* width from the type specifier, or -1 */
   int kind = narrowPKTypeSpelling(pCol, &wType);
-  const char *zRaw = sqlite3ColumnType(pCol, "");
-  int hasSignal = strchr(zRaw, '(')!=0;
+  /* hasSignal starts false: a bare width specifier on the declared type
+  ** (e.g. "TEXT(36)") is NOT by itself a signal that this column is an
+  ** attempted narrow-PK candidate -- see this function's own doc comment
+  ** for why. It's only ever set true below, by an actual CHECK constraint
+  ** shaped like (or at least mentioning) what this optimization requires. */
+  int hasSignal = 0;
   ExprList *pCheck = pTab->pCheck;
   int bText;
   int wCheck = -1;
@@ -2892,16 +2934,18 @@ static void narrowPKFinalize(Parse *pParse, Table *pTab, int bWithoutRowid){
     for(i=0; i<pCheck->nExpr; i++){
       Expr *e = pCheck->a[i].pExpr;
       int w;
-      if( kind!=COLTYPE_REAL && narrowPKMatchLengthEq(e, iCol, bText, &w) ){
+      if( kind!=COLTYPE_REAL
+       && narrowPKMatchLengthEq(e, pCol->zCnName, bText, &w)
+      ){
         hasLengthCheck = 1;
         wCheck = w;
         hasSignal = 1;
-      }else if( narrowPKMatchTypeofEq(e, iCol,
+      }else if( narrowPKMatchTypeofEq(e, pCol->zCnName,
                   kind==COLTYPE_BLOB ? "blob" :
                   kind==COLTYPE_TEXT ? "text" : "real") ){
         hasTypeofCheck = 1;
         hasSignal = 1;
-      }else if( narrowPKExprMentionsColumn(e, iCol) ){
+      }else if( narrowPKExprMentionsColumn(e, pCol->zCnName) ){
         hasSignal = 1;
       }
     }
@@ -3185,13 +3229,36 @@ void sqlite3EndTable(
   }
 
   /* Narrow-fixed-width-PK-as-rowid (README.md): resolve any pending
-  ** candidate left by sqlite3AddPrimaryKey() now that pCheck is fully
-  ** resolved and the STRICT-mode datatype check above has already had
-  ** first refusal. Must run (and, on error, return) before the asserts
-  ** just below, since a near-miss error leaves iPKey<0 with no fallback
-  ** index built -- continuing past the asserts in that state would trip
-  ** them (they require iPKey>=0 or an existing PRIMARYKEY index whenever
-  ** TF_HasPrimaryKey is set). */
+  ** candidate left by sqlite3AddPrimaryKey(), now that the STRICT-mode
+  ** datatype check above has already had first refusal. Must run (and, on
+  ** error, return) before the asserts just below, since a near-miss error
+  ** leaves iPKey<0 with no fallback index built -- continuing past the
+  ** asserts in that state would trip them (they require iPKey>=0 or an
+  ** existing PRIMARYKEY index whenever TF_HasPrimaryKey is set).
+  **
+  ** This deliberately runs BEFORE CHECK-constraint resolution just below,
+  ** not after, even though narrowPKFinalize()'s own CHECK-matching logic
+  ** needs to know which column(s) each CHECK references -- getting that
+  ** from Expr.iColumn would require the official resolution to have
+  ** already run, but that resolution's own correctness for THIS column
+  ** depends in turn on pTab->iPKey already reflecting the outcome:
+  ** mainline's lookupName() resolves a reference to the table's rowid-
+  ** alias column (Expr.iColumn set to -1, the "read the rowid, not a
+  ** stored column" sentinel used throughout codegen) precisely by
+  ** checking iCol==pTab->iPKey at resolution time -- if narrowPKFinalize
+  ** ran AFTER resolution instead, pTab->iPKey wouldn't be set yet when a
+  ** self-referencing CHECK like `typeof(x)='blob'` gets resolved, so `x`
+  ** would resolve to its ordinary column index instead of -1, and later
+  ** CHECK enforcement at DML time would then read that (permanently
+  ** empty, by the alias-column-omitted-from-the-record convention) record
+  ** slot instead of the rowid -- silently and permanently breaking CHECK
+  ** enforcement on every qualifying narrow-PK table (confirmed by
+  ** deliberately trying that ordering: even the simplest single-column
+  ** case starts failing its own required CHECK on every INSERT). So
+  ** narrowPKFinalize()'s own matching (narrowPKExprIsColumnRef()) instead
+  ** matches CHECK constraints against the candidate by column NAME
+  ** (comparing the still-unresolved TK_ID token's text), not by resolved
+  ** index -- see narrowPKExprIsColumnRef()'s own comment. */
   if( p->iNarrowPKCandidate>=0 ){
     int nErrBefore = pParse->nErr;
     narrowPKFinalize(pParse, p, (tabOpts & TF_WithoutRowid)!=0);
