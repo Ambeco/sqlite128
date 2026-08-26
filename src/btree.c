@@ -3426,6 +3426,19 @@ static int lockBtree(BtShared *pBt){
     ** a fresh wide database, but never writes narrow-format rowid cells
     ** itself. */
 #ifdef SQLITE_128BIT_ROWID
+    /* lockBtree() can run more than once against the same BtShared: every
+    ** COMMIT/ROLLBACK/END that drops the transaction count to zero also
+    ** unrefs page 1 (see unlockBtreeIfUnused()), so the next transaction
+    ** re-enters here and re-reads page 1 from scratch. Clear both bits
+    ** before re-deriving them from *this* read, rather than OR-ing the
+    ** fresh result into whatever a previous call left behind -- otherwise
+    ** a single anomalous read (e.g. a VFS shim that temporarily rewrites
+    ** page 1's header, as ext/recover/sqlite3recover.c's wrapper VFS does
+    ** while probing an unrelated database's page size) permanently
+    ** latches BTS_LEGACY_NARROW and forces the file read-only for the
+    ** rest of the connection's life, even once later re-reads correctly
+    ** see the real, wide header again. */
+    pBt->btsFlags &= ~(BTS_LEGACY_NARROW|BTS_WIDE_ROWID);
     if( memcmp(page1, zMagicHeader, 16)==0 ){
       pBt->btsFlags |= BTS_LEGACY_NARROW;  /* legacy narrow file: no writes */
     }else if( memcmp(page1, zMagicHeaderWide, 16)==0 ){
@@ -3831,8 +3844,25 @@ static SQLITE_NOINLINE int btreeBeginTrans(
   ** build (see BTS_LEGACY_NARROW's comment, btreeInt.h): such a build
   ** never writes a narrow-format rowid cell, so it never writes to this
   ** file at all. Read the data out via ordinary SQL into a fresh (wide)
-  ** database instead. */
-  if( (pBt->btsFlags & BTS_LEGACY_NARROW)!=0 && wrflag ){
+  ** database instead.
+  **
+  ** Unlike BTS_READ_ONLY just above (an immutable, whole-connection-
+  ** lifetime property of the underlying file handle), BTS_LEGACY_NARROW is
+  ** derived from page 1's magic-header bytes AFRESH by lockBtree() on every
+  ** transaction that starts from scratch (pBt->pPage1==0) -- see lockBtree()
+  ** for why: page 1 can genuinely read differently between one transaction
+  ** and the next (e.g. ext/recover/sqlite3recover.c's wrapper VFS
+  ** deliberately substitutes a synthetic, mainline-only-spelled header while
+  ** it walks raw pages during ".recover run", then restores the real
+  ** handle once done). So unless a transaction is already open on this
+  ** BtShared (pPage1!=0, meaning the cached flags are still current), this
+  ** stale copy of the flag must not be trusted here -- the loop below is
+  ** about to call lockBtree() and recompute it fresh from *this*
+  ** transaction's own page-1 read. Skipping this fast-path check in that
+  ** case is safe: the authoritative post-lockBtree() check further down
+  ** (paralleling the BTS_READ_ONLY recheck there) still catches a
+  ** genuinely-legacy-narrow file once the fresh read confirms it. */
+  if( pBt->pPage1!=0 && (pBt->btsFlags & BTS_LEGACY_NARROW)!=0 && wrflag ){
     rc = SQLITE_READONLY;
     goto trans_begun;
   }
@@ -3920,7 +3950,7 @@ static SQLITE_NOINLINE int btreeBeginTrans(
     while( pBt->pPage1==0 && SQLITE_OK==(rc = lockBtree(pBt)) );
 
     if( rc==SQLITE_OK && wrflag ){
-      if( (pBt->btsFlags & BTS_READ_ONLY)!=0 ){
+      if( (pBt->btsFlags & (BTS_READ_ONLY|BTS_LEGACY_NARROW))!=0 ){
         rc = SQLITE_READONLY;
       }else{
         rc = sqlite3PagerBegin(pPager, wrflag>1, sqlite3TempInMemory(p->db));
