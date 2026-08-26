@@ -99,7 +99,7 @@ to coincidentally resemble a near-miss, still opens exactly as it always did.
 
 The design in §1/§2 is fully implemented for both widths (up to 8 bytes in any build, up to 16
 bytes under `SQLITE_128BIT_ROWID`), including secondary indexes on a narrow-PK table. What remains
-is a short list of confirmed, reproducible bugs — not unimplemented design:
+is a single confirmed, reproducible bug — not unimplemented design:
 
 - **The near-miss heuristic fires on ordinary, non-narrow-PK schemas.** `build.c`'s
   `narrowPKFinalize()` treats *any* width annotation on a `PRIMARY KEY`'s declared type
@@ -111,20 +111,39 @@ is a short list of confirmed, reproducible bugs — not unimplemented design:
   fork-introduced (not pre-existing) via `test/tkt1449.test`. Likely fix: require an actual
   narrow-PK-shaped `CHECK` hit before treating a column as a near-miss, not a bare width
   annotation on the declared type.
-- **`ext/fts5/test/fts5origintext4.test`: FTS5's doclist-index page-cache heuristic behaves
-  differently under wide rowids.** A broad, low-selectivity query uses ~70KB of page cache under
-  `SQLITE_128BIT_ROWID` vs. ~327KB in a default build (confirmed genuine and reproducible, not
-  flaky), missing one hardcoded cache-size threshold assertion. Not root-caused; would need depth
-  in FTS5's doclist-index internals this project hasn't otherwise touched. Low real-world severity
-  (a page-cache measurement, not incorrect results). Low priority.
 
 Everything else originally suspected of being a `SQLITE_128BIT_ROWID` bug — across `btree.c`'s
-cell-size and balancing code, `PRAGMA integrity_check`, `newDatabase()`'s meta-page setup, and
-large swaths of `ext/recover/*`, `test/pragma.test`, and the `corruptL`/`corruptN`/`dbpage`/
-`diskfull`/`fts3corrupt4`/`fts3fuzz001` test clusters — has been triaged to one of: already fixed,
-intentional by-design behavior (this fork's own wide magic header, or the `BTS_LEGACY_NARROW`
-read-only-for-legacy-files mechanism), or confirmed transient test-environment flakiness. None of
-that history is repeated here; see `git log` for the individual fixes.
+cell-size and balancing code, `PRAGMA integrity_check`, `newDatabase()`'s meta-page setup,
+`ext/recover/*`'s interaction with a wrapper VFS, and large swaths of `test/pragma.test` and the
+`corruptL`/`corruptN`/`dbpage`/`diskfull`/`fts3corrupt4`/`fts3fuzz001` test clusters — has been
+triaged to one of: already fixed, intentional by-design behavior (this fork's own wide magic
+header, or the `BTS_LEGACY_NARROW` read-only-for-legacy-files mechanism), or confirmed transient
+test-environment flakiness. None of that history is repeated here; see `git log` for the
+individual fixes.
+
+One further item is root-caused but deliberately left as a documented, unavoidable interaction
+rather than "fixed," since there is nothing to fix: **`ext/fts5/test/fts5origintext4.test`**
+(`fts5origintext4-1.2.1`) asserts that a broad, low-selectivity query uses more than a hardcoded
+250000-byte page-cache threshold; under `SQLITE_128BIT_ROWID` it uses only ~70KB (vs. ~327KB in a
+default build). Root cause: FTS5's own internal leaf-page target size
+(`FTS5_DEFAULT_PAGE_SIZE`=4050 bytes, unrelated to and unaware of this fork) sits just below this
+build's table-leaf local-payload cap (`usableSize-35` bytes, e.g. 4061 for a 4096-byte page) in a
+default build, so FTS5's ~4051-4055-byte leaf blobs fit entirely locally — but this fork's
+table-leaf cap is intentionally 10 bytes smaller under `SQLITE_128BIT_ROWID`
+(`usableSize-35-10`, `btree.c`), reserving room for the wide rowid key's worst-case 19-byte varint
+(vs. 9 narrow) so fanout guarantees still hold for genuinely large keys — a real, necessary
+correctness margin, confirmed by `test/boundary1.test`/`test/boundary3.test` needing exactly this
+margin. That 10-byte difference is just enough to push FTS5's specific leaf size over the
+threshold, forcing those blobs to spill into overflow pages. Once a payload overflows, mainline
+SQLite's own `SQLITE_DIRECT_OVERFLOW_READ` optimization (on by default, confirmed via a build with
+`-DSQLITE_DIRECT_OVERFLOW_READ=0` restoring the page-cache usage to ~366KB) reads overflow content
+directly from the file, deliberately bypassing the page cache — which is exactly why less shows up
+in `sqlite3_db_status(..., CACHE_USED, ...)`. No data is lost or misread (verified: `ft('the')`'s
+result set has the identical count/sum/min/max as an unfiltered scan in both builds); this is
+purely two independently-correct behaviors — a necessary wide-rowid safety margin, and an
+unrelated, deliberate SQLite cache-bypass optimization — intersecting at a page-size constant
+neither side has any awareness of the other choosing. Reducing the wide-rowid margin to avoid this
+would reopen the real corruption risk it exists to prevent, so this is left as-is.
 
 ## 4. Potential follow-up work
 
